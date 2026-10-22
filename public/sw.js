@@ -1,7 +1,7 @@
 /* Service worker — instant loads + full offline for the installed app.
  * VERSION is stamped by build.js; a new deploy = new cache, old ones are purged.
  * Firebase/gstatic requests pass straight through (the SDK handles its own offline). */
-const VERSION = "muw719qe";
+const VERSION = "mvjpfpjm";
 const CACHE = "weekly-budget-" + VERSION;
 const ASSETS = ["./", "app.js?v=" + VERSION, "react.js", "react-dom.js", "manifest.webmanifest",
   "favicon.svg", "favicon.png", "icon-192.png", "icon-512.png", "apple-touch-icon.png"];

@@ -99,6 +99,7 @@
       cardStyle = mkCard();
       const root = document.documentElement.style;
       Object.keys(C).forEach((k) => root.setProperty("--" + k, C[k]));
+      root.colorScheme = mode === "light" ? "light" : "dark"; // native date pickers follow the theme
       document.body.style.background = C.appBg;
     }
 
@@ -107,6 +108,9 @@
     const TRAVEL_KEY = "weekly-budget-travel";
     const UPDATED_KEY = "weekly-budget-updatedAt";
     const ACCENT_KEY = "weekly-budget-accent";
+    const SYNC_KEY = "weekly-budget-sync-v1";
+    const CARRY_KEY = "weekly-budget-carry";
+    const ONBOARD_KEY = "weekly-budget-onboarded-v1";
 
     const CURRENCIES = [
       { code:"JPY", symbol:"¥", label:"JPY · Japan" }, { code:"EUR", symbol:"€", label:"EUR · Europe" },
@@ -117,6 +121,13 @@
       { code:"INR", symbol:"₹", label:"INR · India" }, { code:"PHP", symbol:"₱", label:"PHP · Philippines" },
     ];
 
+    // Spending-allocation (category) colors — each new category gets the first unused one.
+    const SPEND_COLORS = ["#60a5fa", "#f472b6", "#a78bfa", "#fbbf24", "#34d399", "#fb923c", "#22d3ee", "#f87171", "#a3e635", "#e879f9", "#94a3b8", "#2dd4bf"];
+    const nextSpendColor = (list) => {
+      const used = new Set((list || []).map((a) => (a.color || "").toLowerCase()));
+      return SPEND_COLORS.find((c) => !used.has(c)) || SPEND_COLORS[(list || []).length % SPEND_COLORS.length];
+    };
+
     // Collision-safe id — Date.now() alone can collide across devices (sync) or fast taps.
     const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 
@@ -124,20 +135,58 @@
     const DAY = 86400000;
     const pad2 = (n) => String(n).padStart(2, "0");
     const startOfDay = (ts) => { const d = new Date(ts); d.setHours(0,0,0,0); return d.getTime(); };
-    const addDays = (ts, n) => startOfDay(ts) + n * DAY;
+    // Calendar days, not 24-hour blocks — a period crossing a DST change must still end at midnight.
+    const addDays = (ts, n) => { const d = new Date(startOfDay(ts)); d.setDate(d.getDate() + n); return d.getTime(); };
     const startOfMonth = (ts) => { const d = new Date(ts); return new Date(d.getFullYear(), d.getMonth(), 1).getTime(); };
     const dayKey = (ts) => { const d = new Date(ts); return d.getFullYear()+"-"+pad2(d.getMonth()+1)+"-"+pad2(d.getDate()); };
     const toDateInput = (ts) => { const d = new Date(ts); return d.getFullYear()+"-"+pad2(d.getMonth()+1)+"-"+pad2(d.getDate()); };
     const fromDateInput = (v) => { const a = (v||"").split("-").map(Number); return new Date(a[0], (a[1]||1)-1, a[2]||1, 0,0,0,0).getTime(); };
     const fmtMonthDay = (ts) => new Date(ts).toLocaleDateString("en-US", { month:"short", day:"numeric" });
-    const periodEnd = (p) => addDays(p.startDate, p.lengthDays || 14);
-    const periodRangeLabel = (p) => fmtMonthDay(p.startDate) + " – " + fmtMonthDay(periodEnd(p) - DAY);
-    const LENGTH_PRESETS = [{label:"3 days",d:3},{label:"Weekly",d:7},{label:"Biweekly",d:14},{label:"Monthly",d:30}];
+    const periodEnd = (p) => addDays(p.startDate, p.lengthDays || 14); // exclusive
+    const periodRangeLabel = (p) => fmtMonthDay(p.startDate) + " – " + fmtMonthDay(periodEnd(p) - 1); // last ms of the last day
+    const LENGTH_PRESETS = [{label:"3 days",d:3},{label:"Weekly",d:7},{label:"Biweekly",d:14},{label:"Monthly",monthly:true}];
+    // A calendar month from `start` (Oct 15 → Nov 15), clamped for short months (Jan 31 → Feb 28).
+    const monthLength = (start) => {
+      const d = new Date(start), y = d.getFullYear(), m = d.getMonth();
+      const end = new Date(y, m + 1, Math.min(d.getDate(), new Date(y, m + 2, 0).getDate())).getTime();
+      return Math.round((end - startOfDay(start)) / DAY);
+    };
+    const NOON = 12 * 3600000; // backdated purchases sit mid-day so DST shifts can't move their day
+    const isToday = (ts) => startOfDay(ts) === startOfDay(Date.now());
+    const dayLabel = (ts) => {
+      const k = startOfDay(ts), today = startOfDay(Date.now());
+      if (k === today) return "Today";
+      if (k === startOfDay(today - 1)) return "Yesterday";
+      return new Date(ts).toLocaleDateString("en-US", { weekday:"short", month:"short", day:"numeric" });
+    };
+    const ordinal = (n) => n + (n%10===1 && n!==11 ? "st" : n%10===2 && n!==12 ? "nd" : n%10===3 && n!==13 ? "rd" : "th");
+    // Newest first; purchases with the same timestamp keep reverse insertion order.
+    const newestFirst = (txs) => txs.map((t,i)=>[t,i]).sort((a,b)=>((b[0].date||0)-(a[0].date||0)) || (b[1]-a[1])).map((x)=>x[0]);
+    const reinsert = (arr, idx, item) => { const a = (arr||[]).slice(); a.splice(Math.min(idx, a.length), 0, item); return a; };
 
     function makePeriod(o = {}) {
       return { id:"p"+Date.now()+Math.random().toString(36).slice(2,6), type:"single", createdAt:Date.now(),
         period:"New Pay Period", startDate:startOfDay(Date.now()), lengthDays:14, startingBalance:0,
-        totalIncome:0, savings:0, gasBudget:0, insurance:0, endGoal:0, allocations:[], transactions:[], ...o };
+        totalIncome:0, savings:0, gasBudget:0, insurance:0, endGoal:0, allocations:[], spendingAllocations:[], transactions:[], ...o };
+    }
+
+    // The purchases a recurring expense adds to a pay period: one on its first day ("every period"),
+    // or for "monthly on the Nth", one per Nth that falls inside the period — none if none does, so
+    // a monthly bill isn't counted twice by biweekly periods.
+    function recurringTxFor(p, r) {
+      const category = r.category === "gas" ? "gas" : "spending";
+      const tx = { recurringId:r.id, amount:r.amount, merchant:(r.merchant||"").trim()||"Recurring", category };
+      const want = category === "spending" && (r.allocName||"").trim().toLowerCase();
+      const alloc = want && (p.spendingAllocations||[]).find((a)=>(a.name||"").trim().toLowerCase()===want);
+      if (alloc) tx.allocId = alloc.id;
+      if (r.freq !== "monthly") return [{ ...tx, id:uid(), recurringKey:r.id, date:p.startDate }];
+      const out = [], start = startOfDay(p.startDate), end = periodEnd(p);
+      const d0 = new Date(start);
+      for (let y = d0.getFullYear(), m = d0.getMonth(); new Date(y, m, 1).getTime() < end; m++) {
+        const day = new Date(y, m, Math.min(r.day||1, new Date(y, m+1, 0).getDate())).getTime();
+        if (day >= start && day < end) out.push({ ...tx, id:uid(), recurringKey:r.id+":"+dayKey(day), date:day+NOON });
+      }
+      return out;
     }
     // Compress a full single period into a lightweight, read-only archived form.
     // We keep a small stats summary (for the archived dropdown) plus a slimmed
@@ -158,7 +207,7 @@
     function defaultData() {
       return { activePeriodId:"p1", recurring:[], periods:[{ id:"p1", type:"single", createdAt:Date.now(), period:"My Pay Period",
         startDate:startOfDay(Date.now()), lengthDays:14, startingBalance:0, totalIncome:0, savings:0, gasBudget:0,
-        insurance:0, endGoal:0, allocations:[], transactions:[] }] };
+        insurance:0, endGoal:0, allocations:[], spendingAllocations:[], transactions:[] }] };
     }
     const DEFAULT_DATA = defaultData();
 
@@ -172,6 +221,7 @@
       return { type:"single", createdAt:0, period:"Pay Period", lengthDays:14, startingBalance:0, totalIncome:0,
         savings:0, gasBudget:0, insurance:0, endGoal:0, ...p, startDate,
         allocations: Array.isArray(p.allocations) ? p.allocations : [],
+        spendingAllocations: Array.isArray(p.spendingAllocations) ? p.spendingAllocations : [],
         transactions: (p.transactions||[]).map((t)=>({ ...t, date: t.date || startDate })),
         cashLimit: { enabled:false, standalone:false, code:"JPY", symbol:"¥", amount:0, rate:150, ...(p.cashLimit||{}) } };
     }
@@ -180,24 +230,75 @@
       if (raw && Array.isArray(raw.transactions)) { const id="p_migrated"; return { activePeriodId:id, recurring:[], periods:[normalizePeriod({ id, createdAt:Date.now(), ...raw })] }; }
       return null;
     }
+    // A "combined" period is a read-only monthly rollup of 2–4 single periods.
     function resolvePeriod(store, p) {
       if (!p || p.type !== "combined") return p;
       const sources = (p.sourceIds||[]).map((id)=>store.periods.find((x)=>x.id===id)).filter((x)=>x && x.type==="single");
-      const base = { ...p, combined:true, readOnly:true, allocations:[], transactions:[], startingBalance:0, totalIncome:0, savings:0, gasBudget:0, insurance:0, endGoal:0, startDate:p.startDate||startOfMonth(Date.now()), lengthDays:30, sourceNames:[] };
+      const base = { ...p, combined:true, readOnly:true, allocations:[], spendingAllocations:[], transactions:[], startingBalance:0, totalIncome:0, savings:0, gasBudget:0, insurance:0, endGoal:0, startDate:p.startDate||startOfMonth(Date.now()), lengthDays:30, sourceNames:[] };
       if (!sources.length) return base;
       const sorted = sources.slice().sort((a,b)=>a.startDate-b.startDate);
       const sum = (f) => sorted.reduce((s,x)=>s+(x[f]||0),0);
       const allocMap = {};
       sorted.forEach((x)=>(x.allocations||[]).forEach((a)=>{ allocMap[a.name]=(allocMap[a.name]||0)+(a.amount||0); }));
       const allocations = Object.keys(allocMap).map((name,i)=>({ id:"ca"+i, name, amount:allocMap[name] }));
+      const spendMap = {}, spendColor = {};
+      sorted.forEach((x)=>(x.spendingAllocations||[]).forEach((a)=>{ spendMap[a.name]=(spendMap[a.name]||0)+(a.amount||0); if (!spendColor[a.name]) spendColor[a.name]=a.color; }));
+      const spendingAllocations = Object.keys(spendMap).map((name,i)=>({ id:"cs"+i, name, amount:spendMap[name], color:spendColor[name]||SPEND_COLORS[i%SPEND_COLORS.length] }));
+      // Re-point each purchase's category at the merged (by-name) category.
+      const nameToCombined = {};
+      spendingAllocations.forEach((a)=>{ nameToCombined[a.name]=a.id; });
       const transactions = [];
-      sorted.forEach((x)=>(x.transactions||[]).forEach((t)=>transactions.push({ ...t, _src:x.id })));
+      sorted.forEach((x)=>{
+        const srcName = {};
+        (x.spendingAllocations||[]).forEach((a)=>{ srcName[a.id]=a.name; });
+        (x.transactions||[]).forEach((t)=>transactions.push({ ...t, _src:x.id, allocId: t.allocId && srcName[t.allocId]!=null ? nameToCombined[srcName[t.allocId]] : undefined }));
+      });
       const startDate = sorted[0].startDate;
       const lastEnd = Math.max.apply(null, sorted.map((x)=>periodEnd(x)));
       return { ...base, startingBalance:sorted[0].startingBalance, totalIncome:sum("totalIncome"), savings:sum("savings"),
-        gasBudget:sum("gasBudget"), insurance:sum("insurance"), endGoal:sum("endGoal"), allocations, transactions, startDate,
+        gasBudget:sum("gasBudget"), insurance:sum("insurance"), endGoal:sum("endGoal"), allocations, spendingAllocations, transactions, startDate,
         lengthDays:Math.max(1, Math.round((lastEnd-startDate)/DAY)), sourceNames:sorted.map((x)=>x.period) };
     }
+
+    /* ================= Sync merge ================= */
+    // The period + purchase ids present in the last version both sides agreed on. Against it, a
+    // purchase missing from one side was either deleted there (it's in the base) or added on the
+    // other side since (it isn't).
+    const syncBase = (s) => ({
+      p: s.periods.map((p)=>p.id),
+      t: [].concat(...s.periods.map((p)=>(p.transactions||[]).map((t)=>t.id))),
+    });
+
+    // Both devices edited since they last synced. Settings, budgets and names come from `win`
+    // (the newer side); periods and purchases added or deleted on either side are all kept.
+    function mergeStores(win, lose, base) {
+      const bp = new Set((base && base.p) || []), bt = new Set((base && base.t) || []);
+      const loseById = {};
+      lose.periods.forEach((p)=>{ loseById[p.id] = p; });
+      const winIds = new Set(win.periods.map((p)=>p.id));
+      const mergeTx = (wp, lp) => {
+        if (!Array.isArray(wp.transactions) || !Array.isArray(lp.transactions)) return wp;
+        const wIds = new Set(wp.transactions.map((t)=>t.id)), lIds = new Set(lp.transactions.map((t)=>t.id));
+        const kept = wp.transactions.filter((t)=>lIds.has(t.id) || !bt.has(t.id)); // drop ones `lose` deleted
+        const added = lp.transactions.filter((t)=>!wIds.has(t.id) && !bt.has(t.id)); // ones `lose` added
+        if (!added.length && kept.length === wp.transactions.length) return wp;
+        return { ...wp, transactions:[...kept, ...added] };
+      };
+      const periods = [];
+      win.periods.forEach((p)=>{
+        const lp = loseById[p.id];
+        if (lp) periods.push(mergeTx(p, lp));
+        else if (!bp.has(p.id)) periods.push(p); // new on `win`; otherwise `lose` deleted it
+      });
+      const loseNew = lose.periods.filter((p)=>!winIds.has(p.id) && !bp.has(p.id));
+      const merged = { ...win, periods:[...loseNew, ...periods] };
+      if (!merged.periods.length) return win;
+      if (!merged.periods.some((p)=>p.id===merged.activePeriodId)) {
+        merged.activePeriodId = (merged.periods.find((p)=>p.type==="single") || merged.periods[0]).id;
+      }
+      return merged;
+    }
+
     function loadStore() {
       try { const raw = localStorage.getItem(STORAGE_KEY); if (raw) { const n = normalize(JSON.parse(raw)); if (n) return n; } } catch (e) {}
       return DEFAULT_DATA;
@@ -244,7 +345,29 @@
       const afterCash = afterAlloc - cashSetAside;
       const rawLimit = afterCash - p.endGoal;
       const spendingLimit = Math.max(0, rawLimit);
-      return { spent, gasSpent, gasReimbursed, reimbursed, allocTotal, available, afterSavings, afterGas, afterInsurance, afterAlloc, afterCash, rawLimit, spendingLimit,
+      // Spending allocations split the spending limit into categories — they don't lower it.
+      const spendAllocTotal = (p.spendingAllocations||[]).reduce((s,a)=>s+(a.amount||0),0);
+      // Net USD spent per spending category (purchases − refunds tagged with that category). Untagged
+      // purchases, or ones whose category was deleted, count as "Other".
+      const catSpent = {};
+      (p.spendingAllocations||[]).forEach((a)=>{ catSpent[a.id] = 0; });
+      let otherSpent = 0;
+      p.transactions.forEach((t)=>{
+        if (isCash(t) || (t.category !== "spending" && t.category !== "reimbursement")) return;
+        const v = t.category === "reimbursement" ? -t.amount : t.amount;
+        if (t.allocId && catSpent[t.allocId] != null) catSpent[t.allocId] += v; else otherSpent += v;
+      });
+      // Going over a category spills the extra into "Other": it all comes out of the same limit,
+      // so Other's room shrinks by however much the categories are over.
+      const catOver = {};
+      let spillover = 0;
+      (p.spendingAllocations||[]).forEach((a)=>{
+        const over = Math.round((catSpent[a.id] - (a.amount||0)) * 100) / 100;
+        if (over > 0) { catOver[a.id] = over; spillover += over; }
+      });
+      spillover = Math.round(spillover * 100) / 100;
+      return { spendAllocTotal, unallocatedSpending: spendingLimit - spendAllocTotal, catSpent, otherSpent, catOver, spillover,
+        spent, gasSpent, gasReimbursed, reimbursed, allocTotal, available, afterSavings, afterGas, afterInsurance, afterAlloc, afterCash, rawLimit, spendingLimit,
         remainingSpending: spendingLimit - spent + reimbursed, remainingGas: p.gasBudget - gasSpent + gasReimbursed,
         projectedLeftover: afterCash - spent + reimbursed + (p.gasBudget - gasSpent + gasReimbursed),
         cashOn, cashSpent, cashReimbursed, cashLimitAmt, cashRemaining, cashSetAside, cashStandalone: cashOn && !!cl.standalone };
@@ -269,6 +392,176 @@
       const frac = Math.max(0, Math.min(1, fraction||0));
       return <div style={{ height:9, background:C.border, borderRadius:99, overflow:"hidden" }}><div style={{ height:"100%", width:`${frac*100}%`, background: over?C.red:`linear-gradient(90deg, ${C.greenDim}, ${C.green})`, borderRadius:99, transition:"width 0.5s ease, background 0.3s ease" }} /></div>;
     }
+    // Donut where each section is one spending category, sized by its budget. Each section is its own
+    // progress track: faded = budgeted, solid = spent so far (red once that category is over).
+    function CategoryRing({ sections, size = 200, stroke = 16, onTap, children }) {
+      const r = (size-stroke)/2, c = 2*Math.PI*r;
+      const secs = sections.filter((s)=>s.value > 0);
+      const total = secs.reduce((s,x)=>s+x.value, 0) || 1;
+      const gap = secs.length > 1 ? 3 : 0;
+      const ring = (key, color, dash, start, opacity, tap) => (
+        <circle key={key} cx={size/2} cy={size/2} r={r} fill="none" stroke={color} strokeWidth={stroke} strokeOpacity={opacity}
+          strokeDasharray={`${Math.max(0,dash)} ${c}`} strokeDashoffset={-start} transform={`rotate(-90 ${size/2} ${size/2})`}
+          onClick={tap} style={{ cursor: tap?"pointer":"default", transition:"stroke-dasharray 0.5s ease, stroke-dashoffset 0.5s ease, stroke 0.3s ease" }} />
+      );
+      let off = 0;
+      return (
+        <div style={{ position:"relative", width:size, height:size, flexShrink:0 }}>
+          <svg width={size} height={size}>
+            <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={C.border} strokeWidth={stroke} />
+            {secs.map((s)=>{
+              const len = (s.value/total)*c - gap, start = off;
+              off += len + gap;
+              const spill = s.spill || 0; // overage from other categories, drawn in red after this one's own spending
+              const fill = Math.max(0, Math.min(1, s.spent/s.value)) * len;
+              const spillLen = Math.min(len - fill, (spill/s.value)*len);
+              const tap = onTap && s.id !== "other" ? () => onTap(s.id) : undefined;
+              return (
+                <g key={s.id}>
+                  {ring("t", s.color, len, start, 0.28, tap)}
+                  {fill > 0 && ring("f", s.spent > s.value + 0.004 ? C.red : s.color, fill, start, 1, tap)}
+                  {spillLen > 0 && ring("s", C.red, spillLen, start + fill, 1, tap)}
+                </g>
+              );
+            })}
+          </svg>
+          <div style={{ position:"absolute", inset:0, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", pointerEvents:"none" }}>{children}</div>
+        </div>
+      );
+    }
+
+    // One category's progress bar: spent vs. its budget, in the category's color. For "Other",
+    // `spillFrom` lists the categories that went over — their overage is drawn in red and comes out of Other.
+    function CatProgress({ color, name, spent, budget, last, spillTo, spillFrom = [] }) {
+      const spill = spillFrom.reduce((s,x)=>s+x.amount, 0);
+      const over = spent + spill > budget + 0.004;
+      const left = Math.round((budget - spent - spill) * 100) / 100;
+      const ownW = budget > 0 ? Math.max(0, Math.min(1, spent/budget)) : (spent > 0 ? 1 : 0);
+      const spillW = budget > 0 ? Math.min(1 - ownW, spill/budget) : (spill > 0 ? 1 - ownW : 0);
+      return (
+        <div style={{ padding:"11px 0", borderBottom: last?"none":`1px solid ${C.border}` }}>
+          <div style={{ display:"flex", alignItems:"center", gap:9, marginBottom:7 }}>
+            <span style={{ width:11, height:11, borderRadius:99, background:color, flexShrink:0 }} />
+            <div style={{ flex:1, minWidth:0, fontSize:14, color:C.text, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{name}</div>
+            <div style={{ fontSize:13, color:C.sub, whiteSpace:"nowrap" }}><strong style={{ color:C.text }}>{fmt(spent)}</strong> of {fmt(budget)}</div>
+          </div>
+          <div style={{ height:8, background:C.border, borderRadius:99, overflow:"hidden", display:"flex" }}>
+            <div style={{ height:"100%", width:`${ownW*100}%`, background: spent > budget + 0.004 ? C.red : color, borderRadius: spillW > 0 ? "99px 0 0 99px" : 99, transition:"width 0.5s ease, background 0.3s ease" }} />
+            {spillW > 0 && <div style={{ height:"100%", width:`${spillW*100}%`, background:`repeating-linear-gradient(-45deg, ${C.red} 0 5px, rgba(248,113,113,0.6) 5px 10px)`, borderRadius: ownW > 0 ? "0 99px 99px 0" : 99, transition:"width 0.5s ease" }} />}
+          </div>
+          <div style={{ display:"flex", justifyContent:"space-between", gap:10, marginTop:5, fontSize:11.5 }}>
+            <div style={{ minWidth:0, color:C.red, lineHeight:1.35 }}>
+              {spill > 0 && <React.Fragment>−{fmt(spill)} went to cover {spillFrom.map((x,i)=>(
+                <React.Fragment key={x.name+i}>{i > 0 && (i === spillFrom.length-1 ? " & " : ", ")}<span style={{ display:"inline-block", width:7, height:7, borderRadius:99, background:x.color, margin:"0 3px 0 1px", verticalAlign:"middle" }} />{x.name}</React.Fragment>
+              ))} going over</React.Fragment>}
+            </div>
+            <div style={{ color: over?C.red:C.muted, whiteSpace:"nowrap", textAlign:"right" }}>
+              {over ? `${fmt(-left)} over` : `${fmt(left)} left`}
+              {over && spillTo && <div style={{ fontSize:11, color:C.muted }}>taken from {spillTo}</div>}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function SpendColorModal({ alloc, others, onPick, onClose }) {
+      const used = new Set(others.map((a)=>(a.color||"").toLowerCase()));
+      const cur = (alloc.color||"").toLowerCase();
+      const isCustom = cur && !SPEND_COLORS.includes(cur);
+      return (
+        <div onClick={onClose} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.6)", zIndex:60, display:"flex", alignItems:"center", justifyContent:"center", padding:20, animation:"fadeIn 0.2s ease" }}>
+          <div onClick={(e)=>e.stopPropagation()} style={{ width:"100%", maxWidth:380, background:C.bg2, border:`1px solid ${C.border}`, borderRadius:18, padding:22, animation:"popIn 0.2s ease" }}>
+            <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:18 }}>
+              <span style={{ width:16, height:16, borderRadius:99, background:alloc.color, flexShrink:0 }} />
+              <div style={{ flex:1, minWidth:0, fontSize:16, fontWeight:800, color:C.text, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{alloc.name || "Category"} color</div>
+              <button onClick={onClose} aria-label="Close" style={{ width:30, height:30, borderRadius:8, border:"none", background:"transparent", color:C.muted, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" }}><X size={16} /></button>
+            </div>
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(6, 1fr)", gap:12, justifyItems:"center" }}>
+              {SPEND_COLORS.map((col)=>{
+                const sel = col === cur, taken = !sel && used.has(col);
+                return (
+                  <button key={col} onClick={()=>{ onPick(col); onClose(); }} aria-label={"Color "+col} title={taken ? "Used by another category" : undefined}
+                    style={{ width:38, height:38, borderRadius:99, cursor:"pointer", background:col, border:`2px solid ${sel?C.text:"transparent"}`, boxShadow: sel?`inset 0 0 0 2px ${C.bg2}`:"none", opacity: taken?0.35:1, display:"flex", alignItems:"center", justifyContent:"center", padding:0 }}>
+                    {sel && <Check size={16} color="#0b0d12" strokeWidth={3} />}
+                  </button>
+                );
+              })}
+            </div>
+            <div style={{ display:"flex", alignItems:"center", gap:12, marginTop:18, paddingTop:16, borderTop:`1px solid ${C.border}` }}>
+              <label style={{ width:38, height:38, borderRadius:99, cursor:"pointer", border:`2px solid ${isCustom?C.text:"transparent"}`, background: isCustom ? alloc.color : "conic-gradient(#f43f5e, #fbbf24, #34d399, #22d3ee, #3b82f6, #8b5cf6, #f43f5e)", position:"relative", overflow:"hidden", flexShrink:0 }}>
+                <input type="color" value={alloc.color||"#60a5fa"} onChange={(e)=>onPick(e.target.value)} style={{ position:"absolute", inset:0, opacity:0, cursor:"pointer", border:"none" }} />
+              </label>
+              <div style={{ fontSize:13, color:C.sub, lineHeight:1.4 }}>Custom color<div style={{ fontSize:11.5, color:C.muted }}>Faded swatches are used by other categories</div></div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function SpendAllocRow({ a, spent = 0, onUpdate, onRemove, onColor, readOnly }) {
+      const [amt, setAmt] = useState(a.amount ? String(a.amount) : "");
+      const dot = <span style={{ width:16, height:16, borderRadius:99, background:a.color||C.muted, display:"block" }} />;
+      const budget = a.amount || 0, over = spent > budget + 0.004;
+      const progress = (
+        <div style={{ display:"flex", alignItems:"center", gap:8, paddingBottom:10, borderBottom:`1px solid ${C.border}` }}>
+          <div style={{ flex:1, height:6, background:C.border, borderRadius:99, overflow:"hidden" }}>
+            <div style={{ height:"100%", width:`${budget > 0 ? Math.max(0, Math.min(1, spent/budget))*100 : (spent > 0 ? 100 : 0)}%`, background: over?C.red:(a.color||C.muted), borderRadius:99, transition:"width 0.5s ease" }} />
+          </div>
+          <div style={{ fontSize:11.5, color: over?C.red:C.muted, whiteSpace:"nowrap" }}>{fmt(spent)} spent</div>
+        </div>
+      );
+      if (readOnly) {
+        return (
+          <div>
+            <div style={{ display:"flex", alignItems:"center", gap:10, padding:"11px 0 8px" }}>
+              {dot}
+              <div style={{ flex:1, fontSize:14, color:C.text }}>{a.name || "Category"}</div>
+              <div style={{ fontSize:14, fontWeight:700 }}>{fmt(a.amount||0)}</div>
+            </div>
+            {progress}
+          </div>
+        );
+      }
+      return (
+        <div>
+          <div style={{ display:"flex", alignItems:"center", gap:8, padding:"9px 0 8px" }}>
+            <button onClick={()=>onColor(a.id)} aria-label="Change color" title="Change color" style={{ width:30, height:30, borderRadius:8, border:`1px solid ${C.border}`, background:C.bg2, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0, padding:0 }}>{dot}</button>
+            <input value={a.name} onChange={(e)=>onUpdate(a.id, { name:e.target.value })} placeholder="Name (e.g. Food)"
+              style={{ flex:1, minWidth:0, background:C.bg2, border:`1px solid ${C.border}`, borderRadius:10, outline:"none", color:C.text, fontSize:14, padding:"9px 10px" }} />
+            <div style={{ display:"flex", alignItems:"center", background:C.bg2, border:`1px solid ${C.border}`, borderRadius:10, padding:"0 8px", width:110, flexShrink:0 }}>
+              <span style={{ color:C.muted, fontSize:13 }}>$</span>
+              <input inputMode="decimal" value={amt} onChange={(e)=>{ const v=e.target.value; if(!/^\d*\.?\d*$/.test(v)) return; setAmt(v); const n=v===""||v==="."?0:parseFloat(v); onUpdate(a.id, { amount:isNaN(n)?0:n }); }} placeholder="0.00"
+                style={{ background:"transparent", border:"none", outline:"none", color:C.text, fontSize:14, fontWeight:600, width:"100%", textAlign:"right", padding:"9px 2px" }} />
+            </div>
+            <button onClick={()=>onRemove(a.id)} aria-label="Remove category" title="Remove category" style={{ width:30, height:30, borderRadius:8, border:"none", background:"transparent", color:C.muted, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}><X size={15} /></button>
+          </div>
+          {progress}
+        </div>
+      );
+    }
+
+    const SPEND_SUGGESTIONS = ["Food", "Eating out", "Fun", "Shopping", "Subscriptions", "Personal care"];
+
+    // Spending-category chips: "Other" + one per category (with how much is left in it).
+    function CatPicker({ allocs, value, onChange, catSpent, otherLeft, compact }) {
+      const chip = (id, label, color, sub) => {
+        const on = value === id;
+        return (
+          <button key={id||"other"} onClick={()=>onChange(id)} style={{ display:"flex", alignItems:"center", gap:6, padding: compact?"6px 10px":"7px 11px", borderRadius:999, border:`1px solid ${on?color:C.border}`, background: on?C.cardHi:"transparent", color: on?C.text:C.sub, fontSize:12.5, fontWeight:600, cursor:"pointer", whiteSpace:"nowrap" }}>
+            <span style={{ width:9, height:9, borderRadius:99, background:color, flexShrink:0 }} />
+            {label}
+            {sub != null && <span style={{ fontSize:11, fontWeight:600, color: sub < 0 ? C.red : C.muted }}>{fmt(sub)}</span>}
+          </button>
+        );
+      };
+      return (
+        <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+          {chip("", "Other", C.green, compact || otherLeft == null ? null : otherLeft)}
+          {allocs.map((a)=>chip(a.id, a.name||"Category", a.color||C.muted, compact || !catSpent ? null : (a.amount||0) - (catSpent[a.id]||0)))}
+        </div>
+      );
+    }
+
     function KpiCard({ icon, label, value, color, sub }) {
       return (
         <div className="hoverable lift" style={{ ...cardStyle, padding:18 }}>
@@ -312,10 +605,13 @@
         </div>
       );
     }
-    function Toast({ message, undo, onClose }) {
+    function Toast({ message, note, undo, onClose }) {
       return (
-        <div style={{ position:"fixed", left:"50%", bottom:28, transform:"translateX(-50%)", zIndex:90, display:"flex", alignItems:"center", gap:14, background:C.cardHi, border:`1px solid ${C.borderHi}`, borderRadius:12, padding:"12px 16px", boxShadow:"0 10px 30px rgba(0,0,0,0.45)", animation:"toastIn 0.25s cubic-bezier(0.22,1,0.36,1)" }}>
-          <span style={{ fontSize:13.5, color:C.text }}>{message}</span>
+        <div className="toast" style={{ position:"fixed", left:"50%", bottom:28, transform:"translateX(-50%)", zIndex:90, display:"flex", alignItems:"center", gap:14, background:C.cardHi, border:`1px solid ${C.borderHi}`, borderRadius:12, padding:"12px 16px", boxShadow:"0 10px 30px rgba(0,0,0,0.45)", animation:"toastIn 0.25s cubic-bezier(0.22,1,0.36,1)", maxWidth:"calc(100% - 32px)" }}>
+          <div style={{ minWidth:0 }}>
+            <div style={{ fontSize:13.5, color:C.text, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{message}</div>
+            {note && <div style={{ fontSize:12, color:C.red, marginTop:2, lineHeight:1.35 }}>{note}</div>}
+          </div>
           {undo && <button onClick={undo} style={{ background:"transparent", border:"none", color:C.green, fontSize:13.5, fontWeight:700, cursor:"pointer", padding:0 }}>Undo</button>}
           <button onClick={onClose} style={{ background:"transparent", border:"none", color:C.muted, cursor:"pointer", display:"flex", padding:0 }}><X size={16} /></button>
         </div>
@@ -323,13 +619,22 @@
     }
 
     /* ================= Transaction row ================= */
-    function TxRow({ t, onRemove, onUpdate, readOnly }) {
+    function TxRow({ t, onRemove, onUpdate, readOnly, allocs = [], hideDate, periodTag }) {
       const [editing, setEditing] = useState(false);
       const [amount, setAmount] = useState(String(t.amount));
       const [merchant, setMerchant] = useState(t.merchant);
       const [category, setCategory] = useState(t.category);
-      const startEdit = () => { setAmount(String(t.amount)); setMerchant(t.merchant); setCategory(t.category); setEditing(true); };
-      const save = () => { const a = parseFloat(amount); if (isNaN(a)||a<=0) return; onUpdate(t.id, { amount:Math.round(a*100)/100, merchant:merchant.trim()||defaultMerchant(category), category }); setEditing(false); };
+      const [allocId, setAllocId] = useState(t.allocId || "");
+      const [day, setDay] = useState(toDateInput(t.date || Date.now()));
+      const cat = t.allocId && (t.category==="spending" || t.category==="reimbursement") ? allocs.find((a)=>a.id===t.allocId) : null;
+      const canCat = allocs.length > 0 && (category==="spending" || category==="reimbursement");
+      const startEdit = () => { setAmount(String(t.amount)); setMerchant(t.merchant); setCategory(t.category); setAllocId(t.allocId||""); setDay(toDateInput(t.date||Date.now())); setEditing(true); };
+      const save = () => {
+        const a = parseFloat(amount); if (isNaN(a)||a<=0) return;
+        const patch = { amount:Math.round(a*100)/100, merchant:merchant.trim()||defaultMerchant(category), category, allocId: canCat && allocId ? allocId : undefined };
+        if (day && day !== toDateInput(t.date||Date.now())) patch.date = fromDateInput(day) + NOON; // only re-date when the day changed
+        onUpdate(t.id, patch); setEditing(false);
+      };
       if (editing) {
         return (
           <div style={{ padding:"12px 0", borderBottom:`1px solid ${C.border}` }}>
@@ -345,14 +650,25 @@
                 <button key={v} onClick={()=>setCategory(v)} style={{ flex:1, padding:"8px 0", borderRadius:9, border:`1px solid ${category===v?C.accent:C.border}`, background:category===v?"rgba(129,140,248,0.15)":"transparent", color:category===v?C.text:C.sub, fontSize:12, fontWeight:600, whiteSpace:"nowrap", cursor:"pointer" }}>{catLabel(v)}</button>
               ))}
             </div>
-            <div style={{ display:"flex", gap:8, justifyContent:"flex-end" }}>
-              <button onClick={()=>setEditing(false)} style={{ width:42, height:34, borderRadius:9, border:`1px solid ${C.border}`, background:"transparent", color:C.sub, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" }}><X size={16} /></button>
-              <button onClick={save} style={{ width:42, height:34, borderRadius:9, border:"none", background:C.green, color:"#06281d", cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" }}><Check size={16} /></button>
+            {canCat && <div style={{ marginBottom:8 }}><CatPicker allocs={allocs} value={allocId} onChange={setAllocId} compact /></div>}
+            <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+              <div style={{ display:"flex", alignItems:"center", gap:7, flex:1, minWidth:0, background:C.bg2, border:`1px solid ${C.border}`, borderRadius:9, padding:"0 10px", height:34 }}>
+                <CalendarDays size={14} color={C.muted} />
+                <input type="date" value={day} onChange={(e)=>setDay(e.target.value)} aria-label="Purchase date" style={{ flex:1, minWidth:0, background:"transparent", border:"none", outline:"none", color:C.text, fontSize:13 }} />
+              </div>
+              <button onClick={()=>setEditing(false)} aria-label="Cancel" title="Cancel" style={{ width:42, height:34, borderRadius:9, border:`1px solid ${C.border}`, background:"transparent", color:C.sub, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" }}><X size={16} /></button>
+              <button onClick={save} aria-label="Save" title="Save" style={{ width:42, height:34, borderRadius:9, border:"none", background:C.green, color:"#06281d", cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" }}><Check size={16} /></button>
             </div>
           </div>
         );
       }
       const isReimb = isRefundCat(t.category);
+      const meta = [];
+      if (!hideDate && t.date) meta.push(fmtMonthDay(t.date));
+      if (periodTag) meta.push(periodTag);
+      if (cat) meta.push(<span style={{ color:C.sub }}><span style={{ display:"inline-block", width:7, height:7, borderRadius:99, background:cat.color||C.muted, marginRight:4, verticalAlign:"middle" }} />{cat.name||"Category"}</span>);
+      if (t.recurringId) meta.push(<span style={{ color:C.accent }}>recurring</span>);
+      if (t.foreignAmount) meta.push(<span style={{ color:C.accent }}>{t.foreignSymbol}{Math.round(t.foreignAmount).toLocaleString()} {t.foreignCode}</span>);
       return (
         <div className="navitem" style={{ display:"flex", alignItems:"center", padding:"12px 10px", margin:"0 -10px", borderRadius:10, borderBottom:`1px solid ${C.border}` }}>
           <div style={{ width:34, height:34, borderRadius:10, background: isReimb?"rgba(52,211,153,0.15)":(t.category==="gas"?"rgba(34,211,238,0.12)":"rgba(129,140,248,0.12)"), display:"flex", alignItems:"center", justifyContent:"center", marginRight:12, flexShrink:0 }}>
@@ -360,20 +676,55 @@
           </div>
           <div style={{ flex:1, minWidth:0 }}>
             <div style={{ fontSize:14.5, color:C.text, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{t.merchant}</div>
-            <div style={{ fontSize:11.5, color:C.muted, marginTop:1 }}>{t.date && fmtMonthDay(t.date)}{t.recurringId && <span style={{ color:C.accent }}> · recurring</span>}{t.foreignAmount && <span style={{ color:C.accent }}> · {t.foreignSymbol}{Math.round(t.foreignAmount).toLocaleString()} {t.foreignCode}</span>}</div>
+            {meta.length > 0 && (
+              <div style={{ fontSize:11.5, color:C.muted, marginTop:1, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
+                {meta.map((m,i)=><React.Fragment key={i}>{i ? " · " : ""}{m}</React.Fragment>)}
+              </div>
+            )}
           </div>
           <div style={{ fontSize:15, fontWeight:700, marginRight: readOnly?2:6, color: isReimb?C.green:C.text }}>{isReimb?"+":""}{fmt(t.amount)}</div>
-          {!readOnly && <button onClick={startEdit} style={{ width:28, height:28, borderRadius:8, border:"none", background:"transparent", color:C.muted, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" }}><Pencil size={15} /></button>}
-          {!readOnly && <button onClick={()=>onRemove(t.id)} style={{ width:28, height:28, borderRadius:8, border:"none", background:"transparent", color:C.muted, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" }}><X size={16} /></button>}
+          {!readOnly && <button onClick={startEdit} aria-label="Edit" title="Edit" style={{ width:28, height:28, borderRadius:8, border:"none", background:"transparent", color:C.muted, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" }}><Pencil size={15} /></button>}
+          {!readOnly && <button onClick={()=>onRemove(t.id)} aria-label="Delete" title="Delete" style={{ width:28, height:28, borderRadius:8, border:"none", background:"transparent", color:C.muted, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" }}><X size={16} /></button>}
         </div>
       );
     }
 
+    // Purchases under day headers ("Today", "Yesterday", "Mon, Oct 13"), each with that day's net total.
+    function DayGroups({ txs, renderRow }) {
+      const groups = [];
+      txs.forEach((t)=>{
+        const k = dayKey(t.date || 0);
+        let g = groups[groups.length-1];
+        if (!g || g.k !== k) { g = { k, ts:t.date||0, items:[], total:0 }; groups.push(g); }
+        g.items.push(t);
+        g.total += isRefundCat(t.category) ? -t.amount : t.amount;
+      });
+      return groups.map((g)=>(
+        <div key={g.k}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"baseline", padding:"12px 0 2px", fontSize:11.5, fontWeight:700, color:C.muted, letterSpacing:0.3 }}>
+            <span>{dayLabel(g.ts).toUpperCase()}</span>
+            <span style={{ color: g.total < 0 ? C.green : C.muted }}>{g.total < 0 ? "+"+fmt(-g.total) : fmt(g.total)}</span>
+          </div>
+          {g.items.map(renderRow)}
+        </div>
+      ));
+    }
+
     /* ================= Dashboard ================= */
-    function Dashboard({ data, computed }) {
+    function Dashboard({ data, computed, readOnly, updateSpendAlloc, onEditCategories }) {
       const { available, afterInsurance, spent, spendingLimit, remainingSpending, gasSpent, gasReimbursed, remainingGas, projectedLeftover, reimbursed,
-        cashOn, cashSpent, cashReimbursed, cashLimitAmt, cashRemaining, cashSetAside, cashStandalone } = computed;
+        cashOn, cashSpent, cashReimbursed, cashLimitAmt, cashRemaining, cashSetAside, cashStandalone, unallocatedSpending, catSpent, otherSpent, catOver, spillover } = computed;
       const cl = data.cashLimit || {};
+      const [colorFor, setColorFor] = useState(null);
+      const spendAllocs = data.spendingAllocations || [];
+      const nCats = spendAllocs.length;
+      // Category sections for the ring; "Other" = the unallocated part of the limit + untagged purchases.
+      const catSections = spendAllocs.map((a)=>({ id:a.id, name:a.name||"Category", value:a.amount||0, spent:(catSpent && catSpent[a.id])||0, color:a.color||C.muted }));
+      const otherBudget = Math.max(0, unallocatedSpending);
+      // Categories that went over spill the extra into Other (see computeStats).
+      const spillFrom = catSections.filter((s)=>catOver && catOver[s.id]).map((s)=>({ name:s.name, color:s.color, amount:catOver[s.id] }));
+      const otherSection = { id:"other", name:"Other", value:otherBudget, spent:otherSpent||0, spill:spillover||0, color:C.green };
+      const colorAlloc = colorFor && spendAllocs.find((a)=>a.id===colorFor);
       const overSpend = remainingSpending < 0;
       const cashOver = cashRemaining < 0;
       const aboveGoal = projectedLeftover - data.endGoal;
@@ -394,11 +745,18 @@
       })();
       const usdRingCard = (
         <div className="ring-card" style={{ ...cardStyle, display:"flex", alignItems:"center", gap:28, padding:28, flex:"1 1 300px", minWidth:280 }}>
-          <Ring fraction={(spent-reimbursed)/(spendingLimit||1)} over={overSpend} size={190}>
-            <div style={{ fontSize:11, fontWeight:700, color:C.green, letterSpacing:0.5 }}>OVERALL · USD</div>
-            <div style={{ fontSize:30, fontWeight:800, color:overSpend?C.red:C.green, letterSpacing:-0.5, marginTop:2 }}>{fmt(remainingSpending)}</div>
-            <div style={{ fontSize:11, color:C.muted }}>of {fmt(spendingLimit)}</div>
-          </Ring>
+          {(() => {
+            const center = (
+              <React.Fragment>
+                <div style={{ fontSize:11, fontWeight:700, color:C.green, letterSpacing:0.5 }}>OVERALL · USD</div>
+                <div style={{ fontSize: fmt(remainingSpending).length > 9 ? 25 : 30, fontWeight:800, color:overSpend?C.red:C.green, letterSpacing:-0.5, marginTop:2 }}>{fmt(remainingSpending)}</div>
+                <div style={{ fontSize:11, color:C.muted }}>of {fmt(spendingLimit)}</div>
+              </React.Fragment>
+            );
+            return nCats > 0
+              ? <CategoryRing sections={[...catSections, otherSection]} size={190} onTap={readOnly ? null : setColorFor}>{center}</CategoryRing>
+              : <Ring fraction={(spent-reimbursed)/(spendingLimit||1)} over={overSpend} size={190}>{center}</Ring>;
+          })()}
           <div style={{ flex:1, minWidth:0 }}>
             <div style={{ fontSize:13, fontWeight:600, color:C.sub, letterSpacing:0.3, marginBottom:12 }}>THIS PERIOD</div>
             <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
@@ -476,6 +834,33 @@
                 {cashOn && cashRingCard}
               </div>
 
+              {!cashStandalone && (nCats > 0 ? (
+                <div style={cardStyle}>
+                  <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:2 }}>
+                    <div style={{ fontSize:13, fontWeight:600, color:C.sub, letterSpacing:0.3 }}>CATEGORIES</div>
+                    <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+                      <div style={{ fontSize:12, color:C.muted }}>spent of budget</div>
+                      {!readOnly && <button onClick={onEditCategories} style={{ background:"transparent", border:"none", color:C.green, fontSize:12.5, fontWeight:700, cursor:"pointer", padding:0 }}>Edit</button>}
+                    </div>
+                  </div>
+                  {(() => {
+                    const list = [...catSections, ...((otherBudget > 0 || Math.abs(otherSection.spent) > 0.004 || otherSection.spill > 0) ? [otherSection] : [])];
+                    return list.map((s,i)=><CatProgress key={s.id} color={s.color} name={s.name} spent={s.spent} budget={s.value} last={i===list.length-1}
+                      spillTo={s.id!=="other" ? "Other" : null} spillFrom={s.id==="other" ? spillFrom : []} />);
+                  })()}
+                  {!readOnly && <div style={{ fontSize:11.5, color:C.muted, marginTop:8 }}>Click a section of the ring to change its color.</div>}
+                </div>
+              ) : !readOnly && (
+                <button onClick={onEditCategories} className="hoverable" style={{ ...cardStyle, display:"flex", alignItems:"center", gap:12, cursor:"pointer", textAlign:"left", borderStyle:"dashed" }}>
+                  <span style={{ width:34, height:34, borderRadius:10, background:C.cardHi, display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}><Grid size={17} color={C.accent} /></span>
+                  <div style={{ flex:1, minWidth:0 }}>
+                    <div style={{ fontSize:14, fontWeight:600, color:C.text }}>Split your spending into categories</div>
+                    <div style={{ fontSize:12, color:C.muted, marginTop:2 }}>Food, fun, shopping… tag each purchase and track each one with its own ring and bar.</div>
+                  </div>
+                  <Plus size={17} color={C.sub} />
+                </button>
+              ))}
+
               {!cashStandalone && <div style={cardStyle}>
                 <div style={{ fontSize:13, fontWeight:600, color:C.sub, marginBottom:8, letterSpacing:0.3 }}>MONEY FLOW</div>
                 {rows.map((r,i)=>(
@@ -538,14 +923,36 @@
               )}
             </div>
           </div>
+          {colorAlloc && <SpendColorModal alloc={colorAlloc} others={spendAllocs.filter((a)=>a.id!==colorAlloc.id)} onPick={(col)=>updateSpendAlloc(colorAlloc.id, { color:col })} onClose={()=>setColorFor(null)} />}
         </div>
       );
+    }
+
+    /* ================= Exchange rates ================= */
+    // Today's USD → `code` rate (European Central Bank reference rates via Frankfurter — free, no
+    // key; only the currency code is sent). Resolves null when offline or on any error.
+    async function fetchUsdRate(code) {
+      try {
+        const r = await fetch("https://api.frankfurter.dev/v1/latest?base=USD&symbols=" + encodeURIComponent(code));
+        if (!r.ok) return null;
+        const j = await r.json();
+        const v = j && j.rates && j.rates[code];
+        return v > 0 ? { rate: Math.round(v * 10000) / 10000, date: j.date } : null;
+      } catch (e) { return null; }
+    }
+    // Travel rate status line: live (ECB date) vs. typed in, and how old it is.
+    function rateStatus(travel) {
+      const daysSince = travel && travel.rateUpdated ? Math.floor((startOfDay(Date.now()) - startOfDay(travel.rateUpdated)) / DAY) : null;
+      const when = daysSince == null ? "" : daysSince <= 0 ? "today" : daysSince === 1 ? "yesterday" : `${daysSince} days ago`;
+      if (travel && travel.rateSource === "live" && travel.rateCode === travel.code) return { label: `Live rate · updated ${when}`, stale: daysSince >= 1 };
+      if (daysSince == null) return { label: "Set today's rate", stale: false };
+      return { label: `Set by you · ${when}`, stale: daysSince >= 1 };
     }
 
     /* ================= Spending ================= */
     // Quick currency converter — uses the manual Travel-mode rate (edit it here or in Settings),
     // and previews how a purchase would hit the spending limit WITHOUT logging anything.
-    function ConvertView({ computed, travel, setTravel }) {
+    function ConvertView({ computed, travel, setTravel, onRefreshRate }) {
       const [amount, setAmount] = useState("");
       const [toUSD, setToUSD] = useState(true); // true: foreign -> USD; false: USD -> foreign
       const code = (travel && travel.code) || "JPY";
@@ -561,7 +968,7 @@
         if (!/^\d*\.?\d*$/.test(v)) return;
         setRateText(v);
         const n = parseFloat(v);
-        if (!isNaN(n) && n > 0 && setTravel) setTravel((t) => ({ ...t, rate: n, rateUpdated: Date.now() }));
+        if (!isNaN(n) && n > 0 && setTravel) setTravel((t) => ({ ...t, rate: n, rateUpdated: Date.now(), rateSource: "manual", rateCode: t.code }));
       };
 
       const a = parseFloat(amount);
@@ -580,10 +987,7 @@
       const inSym = toUSD ? symbol : "$";
       const outValue = toUSD ? fmt(usdValue) : fmtForeign(foreignValue);
 
-      // How long since the rate was last set — nudges a daily update.
-      const daysSince = travel && travel.rateUpdated ? Math.floor((startOfDay(Date.now()) - startOfDay(travel.rateUpdated)) / DAY) : null;
-      const updatedLabel = daysSince == null ? "Set today's rate" : daysSince <= 0 ? "Updated today" : daysSince === 1 ? "Updated yesterday" : `Updated ${daysSince} days ago`;
-      const stale = daysSince != null && daysSince >= 1;
+      const { label: updatedLabel, stale } = rateStatus(travel);
 
       return (
         <div style={{ display: "flex", flexDirection: "column", gap: 16, maxWidth: 520 }}>
@@ -637,7 +1041,10 @@
                 style={{ flex: 1, minWidth: 0, background: "transparent", border: "none", outline: "none", color: C.text, fontSize: 18, fontWeight: 800, textAlign: "right" }} />
               <span style={{ fontSize: 14, fontWeight: 700, color: C.amber, flexShrink: 0 }}>{symbol}</span>
             </div>
-            <div style={{ fontSize: 12, color: stale ? C.amber : C.muted, marginTop: 7, textAlign: "right" }}>{updatedLabel} · edit above or in Settings</div>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 12, marginTop: 7 }}>
+              <span style={{ fontSize: 12, color: stale ? C.amber : C.muted }}>{updatedLabel}</span>
+              {onRefreshRate && <button onClick={onRefreshRate} style={{ display: "flex", alignItems: "center", gap: 4, background: "transparent", border: "none", color: C.green, fontSize: 12.5, fontWeight: 700, cursor: "pointer", padding: 0 }}><RotateCcw size={12} /> Get today's rate</button>}
+            </div>
           </div>
 
           {/* Spending-limit impact preview (does NOT log anything) */}
@@ -675,153 +1082,318 @@
       );
     }
 
-    function SpendingView({ data, computed, addTransaction, removeTransaction, updateTransaction, readOnly, travel, setTravel, store }) {
+    const DEFAULT_MERCHANTS = new Set(["Purchase", "Gas", "Refund", "Gas Refund", "Recurring"]);
+
+    // Every merchant you've used, most-used first, with the type and category you last logged it as.
+    // Categories are remembered by NAME — each pay period has its own category ids.
+    function useMerchantMemory(store) {
+      return useMemo(() => {
+        const m = {};
+        ((store && store.periods) || []).forEach((p) => {
+          if (p.type === "combined") return;
+          const names = {};
+          (p.spendingAllocations || []).forEach((a) => { names[a.id] = a.name; });
+          (p.transactions || []).forEach((t) => {
+            const name = (t.merchant || "").trim();
+            if (!name || DEFAULT_MERCHANTS.has(name)) return;
+            const k = name.toLowerCase();
+            const e = m[k] || (m[k] = { name, n: 0, last: -1 });
+            e.n++;
+            if ((t.date || 0) >= e.last) { e.last = t.date || 0; e.name = name; e.category = t.category; e.allocName = t.allocId ? names[t.allocId] : undefined; }
+          });
+        });
+        return Object.values(m).sort((a, b) => (b.n - a.n) || (b.last - a.last));
+      }, [store]);
+    }
+
+    // The add-purchase card — used on the Spending tab and in the quick-add dialog.
+    function AddPurchaseForm({ data, computed, store, travel, addTransaction, presetDay, autoFocus, onAdded, title = "ADD PURCHASE", bare }) {
       const [amount, setAmount] = useState("");
       const [merchant, setMerchant] = useState("");
       const [category, setCategory] = useState("spending");
       const [inputUSD, setInputUSD] = useState(false); // in travel mode, log this one purchase in USD instead
-      const [query, setQuery] = useState("");
-      const { spent, spendingLimit, remainingSpending, gasSpent, gasReimbursed, remainingGas, reimbursed, cashRemaining, cashLimitAmt } = computed;
-      const overSpend = remainingSpending < 0;
-      const q = query.trim().toLowerCase();
-      const match = (t) => !q || (t.merchant||"").toLowerCase().includes(q) || String(t.amount).includes(q);
-      const spendingTx = data.transactions.filter((t)=>t.category==="spending" && match(t));
-      const gasTx = data.transactions.filter((t)=>isGasCat(t.category) && match(t));
-      const reimbTx = data.transactions.filter((t)=>t.category==="reimbursement" && match(t));
-      // Most-used merchants across every period — one-tap fill when logging a purchase.
-      const recentMerchants = useMemo(()=>{
-        const counts = {};
-        ((store&&store.periods)||[]).forEach((p)=>{ if (p.type==="combined") return; (p.transactions||[]).forEach((t)=>{
-          const m = (t.merchant||"").trim();
-          if (!m || m==="Purchase" || m==="Gas" || m==="Refund" || m==="Gas Refund" || m==="Recurring") return;
-          const k = m.toLowerCase();
-          if (!counts[k]) counts[k] = { name:m, n:0, last:0 };
-          counts[k].n++; counts[k].last = Math.max(counts[k].last, t.date||0);
-        }); });
-        return Object.values(counts).sort((a,b)=>(b.n-a.n)||(b.last-a.last)).slice(0,6).map((x)=>x.name);
-      }, [store]);
+      const [allocId, setAllocId] = useState(""); // spending category ("" = Other)
+      // The purchase day (start-of-day ms); null = right now. Logging into a past or future period
+      // defaults to its nearest day so the purchase lands inside it.
+      const [day, setDay] = useState(() => {
+        if (presetDay != null) return isToday(presetDay) ? null : startOfDay(presetDay);
+        const today = startOfDay(Date.now()), start = startOfDay(data.startDate), end = periodEnd(data);
+        if (today >= end) return startOfDay(end - 1);
+        if (today < start) return start;
+        return null;
+      });
+      const { remainingSpending, cashRemaining, catSpent, otherSpent, spillover, unallocatedSpending } = computed;
+      const otherLeft = Math.round((Math.max(0, unallocatedSpending) - (otherSpent || 0) - (spillover || 0)) * 100) / 100; // after other categories' overage
+      const spendAllocs = data.spendingAllocations || [];
+      const merchants = useMerchantMemory(store);
       // A period's foreign cash allowance takes priority over the global travel toggle, so purchases
-      // here are logged in that currency and hit both the USD limit and the cash allowance.
+      // here are logged in that currency and count against the cash allowance.
       const cl = data.cashLimit || {};
       const cashOn = !!cl.enabled;
-      const fx = cashOn && cl.rate > 0 ? { code:cl.code, symbol:cl.symbol, rate:cl.rate }
-              : (travel && travel.enabled && travel.rate > 0 ? { code:travel.code, symbol:travel.symbol, rate:travel.rate } : null);
+      const fx = cashOn && cl.rate > 0 ? { code: cl.code, symbol: cl.symbol, rate: cl.rate }
+              : (travel && travel.enabled && travel.rate > 0 ? { code: travel.code, symbol: travel.symbol, rate: travel.rate } : null);
       const travelOn = !!fx;
       const foreignInput = travelOn && !inputUSD; // whether THIS purchase is entered in the foreign currency
       const currSymbol = foreignInput ? fx.symbol : "$";
-      const effRate = travelOn ? fx.rate : (travel.rate || 1);
+      const effRate = travelOn ? fx.rate : ((travel && travel.rate) || 1); // foreign units per 1 USD
+      // Spending categories apply to USD spending/refunds (cash-allowance purchases have their own pool).
+      const showCatPicker = spendAllocs.length > 0 && (category === "spending" || category === "reimbursement") && !(cashOn && foreignInput);
+
+      const q = merchant.trim().toLowerCase();
+      const merchantChips = (q ? merchants.filter((x) => x.name.toLowerCase().includes(q) && x.name.toLowerCase() !== q) : merchants).slice(0, 6);
+      const pickMerchant = (x) => {
+        setMerchant(x.name);
+        // Reuse how it was logged last time — unless a refund is selected on purpose.
+        if (!isRefundCat(category) && (x.category === "spending" || x.category === "gas")) setCategory(x.category);
+        const want = (x.allocName || "").trim().toLowerCase();
+        const match = want && spendAllocs.find((a) => (a.name || "").trim().toLowerCase() === want);
+        setAllocId(match ? match.id : "");
+      };
+
+      const today = startOfDay(Date.now()), yesterday = startOfDay(today - 1);
+      const dayTs = day == null ? today : day;
+      const outside = dayTs < startOfDay(data.startDate) || dayTs >= periodEnd(data);
 
       const handleAdd = () => {
-        const a = parseFloat(amount); if (isNaN(a)||a<=0) return;
-        const usd = foreignInput ? Math.round((a/effRate)*100)/100 : Math.round(a*100)/100;
-        const tx = { id:uid(), amount:usd, merchant:merchant.trim()||defaultMerchant(category), category, date:Date.now() };
-        if (foreignInput) { tx.foreignAmount=a; tx.foreignCode=fx.code; tx.foreignSymbol=fx.symbol; tx.rate=effRate; }
-        addTransaction(tx); setAmount(""); setMerchant("");
+        const a = parseFloat(amount);
+        if (isNaN(a) || a <= 0) return;
+        const usdAmount = foreignInput ? Math.round((a / effRate) * 100) / 100 : Math.round(a * 100) / 100;
+        const tx = {
+          id: uid(), amount: usdAmount,
+          merchant: merchant.trim() || defaultMerchant(category),
+          category, date: day == null || day === today ? Date.now() : day + NOON, createdAt: Date.now(),
+        };
+        if (foreignInput) { tx.foreignAmount = a; tx.foreignCode = fx.code; tx.foreignSymbol = fx.symbol; tx.rate = effRate; }
+        if (showCatPicker && allocId && spendAllocs.some((x) => x.id === allocId)) tx.allocId = allocId;
+        addTransaction(tx);
+        setAmount(""); setMerchant(""); setAllocId(""); // the day stays put — handy when catching up on several
+        if (onAdded) onAdded(tx);
       };
-      const pill = (val,label) => <button onClick={()=>setCategory(val)} style={{ flex:1, padding:"10px 0", borderRadius:10, border:`1px solid ${category===val?C.accent:C.border}`, background:category===val?"rgba(129,140,248,0.15)":"transparent", color:category===val?C.text:C.sub, fontSize:12.5, fontWeight:600, whiteSpace:"nowrap", cursor:"pointer" }}>{label}</button>;
-      const curBtn = (usd,label) => <button onClick={()=>setInputUSD(usd)} style={{ padding:"5px 11px", borderRadius:8, border:`1px solid ${inputUSD===usd?C.amber:C.border}`, background:inputUSD===usd?"rgba(251,191,36,0.14)":"transparent", color:inputUSD===usd?C.text:C.sub, fontSize:12, fontWeight:700, cursor:"pointer" }}>{label}</button>;
+      const curBtn = (usd, label) => (
+        <button onClick={() => setInputUSD(usd)} style={{ padding: "5px 11px", borderRadius: 8, border: `1px solid ${inputUSD === usd ? C.amber : C.border}`, background: inputUSD === usd ? "rgba(251,191,36,0.14)" : "transparent", color: inputUSD === usd ? C.text : C.sub, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>{label}</button>
+      );
+      const pill = (val, label) => (
+        <button onClick={() => setCategory(val)} style={{ flex: 1, padding: "10px 0", borderRadius: 10, border: `1px solid ${category === val ? C.accent : C.border}`, background: category === val ? "rgba(129,140,248,0.15)" : "transparent", color: category === val ? C.text : C.sub, fontSize: 12.5, fontWeight: 600, whiteSpace: "nowrap", cursor: "pointer" }}>{label}</button>
+      );
+      const dayChip = (on, label, onClick) => (
+        <button onClick={onClick} style={{ padding: "6px 12px", borderRadius: 999, border: `1px solid ${on ? C.green : C.border}`, background: on ? "rgba(52,211,153,0.12)" : "transparent", color: on ? C.text : C.sub, fontSize: 12.5, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" }}>{label}</button>
+      );
+      const custom = dayTs !== today && dayTs !== yesterday;
+      return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          {travelOn && (
+            <div style={{ display: "flex", alignItems: "center", gap: 10, background: "rgba(251,191,36,0.07)", border: "1px solid rgba(251,191,36,0.28)", borderRadius: 12, padding: "11px 14px" }}>
+              <Plane size={16} color={C.amber} />
+              <div style={{ flex: 1, fontSize: 13, fontWeight: 600, color: C.amber }}>{fx.code} {cashOn ? "cash allowance" : "travel mode"}</div>
+              <div style={{ textAlign: "right" }}>
+                {cashOn && <div style={{ fontSize: 12.5, fontWeight: 700, color: cashRemaining < 0 ? C.red : C.text }}>{fmtForeign(cashRemaining, fx.symbol, fx.code)} left</div>}
+                <div style={{ fontSize: 12, color: C.muted }}>1 USD = {fx.symbol}{(+effRate).toLocaleString(undefined, { maximumFractionDigits: 2 })}</div>
+              </div>
+            </div>
+          )}
+          <div style={bare ? null : cardStyle}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, gap: 8 }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: C.sub, letterSpacing: 0.3 }}>{title}</div>
+              {travelOn ? (
+                <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                  {curBtn(false, `${fx.symbol} ${fx.code}`)}
+                  {curBtn(true, "$ USD")}
+                </div>
+              ) : (
+                <div style={{ fontSize: 12, color: remainingSpending < 0 ? C.red : C.muted }}>{fmt(remainingSpending)} left</div>
+              )}
+            </div>
+            <div style={{ display: "flex", alignItems: "center", background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 11, padding: "0 14px", marginBottom: 10 }}>
+              <span style={{ color: C.muted, fontSize: 18 }}>{currSymbol}</span>
+              <input inputMode="decimal" autoFocus={autoFocus} value={amount} onChange={(e) => { const v = e.target.value; if (/^\d*\.?\d*$/.test(v)) setAmount(v); }} onKeyDown={(e) => { if (e.key === "Enter") handleAdd(); }} placeholder="0.00"
+                style={{ background: "transparent", border: "none", outline: "none", color: C.text, fontSize: 22, fontWeight: 700, width: "100%", padding: "14px 6px" }} />
+            </div>
+            <input value={merchant} onChange={(e) => setMerchant(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") handleAdd(); }} placeholder="Where? (optional)"
+              style={{ width: "100%", background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 11, outline: "none", color: C.text, fontSize: 15, padding: "13px 14px", marginBottom: 10 }} />
+            {merchantChips.length > 0 && (
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 12 }}>
+                {merchantChips.map((x) => <button key={x.name} onClick={() => pickMerchant(x)} style={{ padding: "5px 11px", borderRadius: 999, border: `1px solid ${C.border}`, background: C.bg2, color: C.sub, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>{x.name}</button>)}
+              </div>
+            )}
+            <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>{pill("spending", "Spending")}{pill("gas", "Gas")}{pill("reimbursement", "Refund")}{pill("gasReimbursement", "Gas Refund")}</div>
+            {showCatPicker && (
+              <div style={{ marginBottom: 12 }}>
+                <div style={{ fontSize: 11.5, fontWeight: 600, color: C.muted, letterSpacing: 0.3, marginBottom: 7 }}>CATEGORY</div>
+                <CatPicker allocs={spendAllocs} value={allocId} onChange={setAllocId} catSpent={catSpent} otherLeft={otherLeft} />
+              </div>
+            )}
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: outside ? 6 : 12, flexWrap: "wrap" }}>
+              {dayChip(dayTs === today, "Today", () => setDay(null))}
+              {dayChip(dayTs === yesterday, "Yesterday", () => setDay(yesterday))}
+              <label style={{ position: "relative", display: "flex", alignItems: "center", gap: 6, padding: "6px 12px", borderRadius: 999, border: `1px solid ${custom ? C.green : C.border}`, background: custom ? "rgba(52,211,153,0.12)" : "transparent", color: custom ? C.text : C.sub, fontSize: 12.5, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap", overflow: "hidden" }}>
+                <CalendarDays size={14} /> {custom ? fmtMonthDay(dayTs) : "Pick date"}
+                <input type="date" value={toDateInput(dayTs)} aria-label="Purchase date" onClick={(e) => { try { e.target.showPicker(); } catch (err) {} }} onChange={(e) => { if (!e.target.value) return; const v = fromDateInput(e.target.value); setDay(v === today ? null : v); }}
+                  style={{ position: "absolute", inset: 0, opacity: 0, cursor: "pointer", border: "none" }} />
+              </label>
+            </div>
+            {outside && <div style={{ fontSize: 11.5, color: C.amber, marginBottom: 12 }}>Outside this pay period ({periodRangeLabel(data)})</div>}
+            <button onClick={handleAdd} style={{ width: "100%", padding: "14px 0", borderRadius: 12, border: "none", background: `linear-gradient(90deg, ${C.greenDim}, ${C.green})`, color: "#06281d", fontSize: 15, fontWeight: 700, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+              <Plus size={18} /> {category === "reimbursement" ? "Add refund" : category === "gasReimbursement" ? "Add gas refund" : "Add purchase"}{dayTs !== today ? " · " + dayLabel(dayTs) : ""}
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    // Dialog with the add-purchase form, opened from the header's "Add purchase" button, the
+    // Calendar's "Add purchase on this day" and the N keyboard shortcut.
+    function QuickAddModal({ period, store, travel, addTransaction, presetDay, isActive, onClose }) {
+      const computed = useMemo(() => computeStats(period), [period]);
+      useEffect(() => {
+        const onKey = (e) => { if (e.key === "Escape") onClose(); };
+        window.addEventListener("keydown", onKey);
+        return () => window.removeEventListener("keydown", onKey);
+      }, []);
+      return (
+        <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", zIndex: 58, display: "flex", alignItems: "center", justifyContent: "center", padding: 20, animation: "fadeIn 0.2s ease" }}>
+          <div onClick={(e) => e.stopPropagation()} style={{ width: "100%", maxWidth: 460, background: C.bg, border: `1px solid ${C.border}`, borderRadius: 18, padding: 20, maxHeight: "90vh", overflowY: "auto", display: "flex", flexDirection: "column", gap: 14, animation: "popIn 0.2s ease" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 17, fontWeight: 700, color: C.text }}>Add purchase</div>
+                <div style={{ fontSize: 12, color: C.sub, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{isActive ? periodRangeLabel(period) : "To " + period.period + " · " + periodRangeLabel(period)}</div>
+              </div>
+              <button onClick={onClose} aria-label="Close" style={{ width: 32, height: 32, borderRadius: 9, border: "none", background: C.card, color: C.sub, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}><X size={18} /></button>
+            </div>
+            <AddPurchaseForm data={period} computed={computed} store={store} travel={travel} addTransaction={addTransaction} presetDay={presetDay} autoFocus onAdded={onClose} title="NEW PURCHASE" />
+          </div>
+        </div>
+      );
+    }
+
+    // Matches merchant, amount, type and category name.
+    const txMatcher = (q, allocs) => {
+      const names = {};
+      (allocs || []).forEach((a) => { names[a.id] = (a.name || "").toLowerCase(); });
+      return (t) => !q || (t.merchant || "").toLowerCase().includes(q) || String(t.amount).includes(q)
+        || catLabel(t.category).toLowerCase().includes(q) || (t.allocId && (names[t.allocId] || "").includes(q));
+    };
+
+    function SpendingView({ data, computed, addTransaction, removeTransaction, updateTransaction, readOnly, travel, store }) {
+      const [query, setQuery] = useState("");
+      const [allPeriods, setAllPeriods] = useState(false);
+      const { spent, spendingLimit, remainingSpending, gasSpent, gasReimbursed, remainingGas, reimbursed, cashRemaining, cashLimitAmt } = computed;
+      const spendAllocs = data.spendingAllocations || [];
+      const overSpend = remainingSpending < 0;
+      const cl = data.cashLimit || {};
+      const cashOn = !!cl.enabled;
+      const q = query.trim().toLowerCase();
+      const match = txMatcher(q, spendAllocs);
+      const sorted = newestFirst(data.transactions);
+      const spendingTx = sorted.filter((t) => t.category === "spending" && match(t));
+      const gasTx = sorted.filter((t) => isGasCat(t.category) && match(t));
+      const reimbTx = sorted.filter((t) => t.category === "reimbursement" && match(t));
+      const hasAnyTx = store.periods.some((p) => (p.transactions || []).length > 0);
+      // Search everywhere: one list, newest first, each row tagged with its pay period.
+      const everywhere = useMemo(() => {
+        if (!q || !allPeriods) return [];
+        const out = [];
+        store.periods.forEach((p) => {
+          if (p.type === "combined") return;
+          const m = txMatcher(q, p.spendingAllocations);
+          (p.transactions || []).forEach((t) => { if (m(t)) out.push({ ...t, _pid: p.id, _pName: p.period, _archived: p.type === "archived", _allocs: p.spendingAllocations || [] }); });
+        });
+        return newestFirst(out);
+      }, [q, allPeriods, store]);
+      const row = (t) => <TxRow key={t.id} t={t} onRemove={removeTransaction} onUpdate={updateTransaction} readOnly={readOnly} allocs={spendAllocs} />;
+      const scopeChip = (on, label, val) => (
+        <button onClick={() => setAllPeriods(val)} style={{ padding: "5px 11px", borderRadius: 999, border: `1px solid ${on ? C.green : C.border}`, background: on ? "rgba(52,211,153,0.12)" : "transparent", color: on ? C.text : C.sub, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>{label}</button>
+      );
       return (
         <div className="two-col">
-          <div className="sticky-col" style={{ display:"flex", flexDirection:"column", gap:16 }}>
-            <div style={{ ...cardStyle, background: overSpend?"rgba(248,113,113,0.1)":"rgba(52,211,153,0.08)", border:`1px solid ${overSpend?"rgba(248,113,113,0.3)":"rgba(52,211,153,0.25)"}`, textAlign:"center" }}>
-              <div style={{ fontSize:12, color:C.sub, marginBottom:4 }}>Remaining Spending</div>
-              <div style={{ fontSize:36, fontWeight:800, color:overSpend?C.red:C.green, letterSpacing:-0.5 }}>{fmt(remainingSpending)}</div>
-              <div style={{ fontSize:12.5, color:C.muted, marginTop:2 }}>{fmt(spent)} spent{reimbursed>0 && <span style={{ color:C.green }}> · +{fmt(reimbursed)} back</span>} of {fmt(spendingLimit)}</div>
-              {cashOn && <div style={{ fontSize:13, fontWeight:700, color:cashRemaining<0?C.red:C.amber, marginTop:8, display:"flex", alignItems:"center", justifyContent:"center", gap:6 }}><Plane size={13} color={C.amber} /> {fmtForeign(cashRemaining, cl.symbol, cl.code)} of {fmtForeign(cashLimitAmt, cl.symbol, cl.code)} cash left</div>}
+          <div className="sticky-col" style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+            <div style={{ ...cardStyle, background: overSpend ? "rgba(248,113,113,0.1)" : "rgba(52,211,153,0.08)", border: `1px solid ${overSpend ? "rgba(248,113,113,0.3)" : "rgba(52,211,153,0.25)"}`, textAlign: "center" }}>
+              <div style={{ fontSize: 12, color: C.sub, marginBottom: 4 }}>Remaining Spending</div>
+              <div style={{ fontSize: 36, fontWeight: 800, color: overSpend ? C.red : C.green, letterSpacing: -0.5 }}>{fmt(remainingSpending)}</div>
+              <div style={{ fontSize: 12.5, color: C.muted, marginTop: 2 }}>{fmt(spent)} spent{reimbursed > 0 && <span style={{ color: C.green }}> · +{fmt(reimbursed)} back</span>} of {fmt(spendingLimit)}</div>
+              {cashOn && <div style={{ fontSize: 13, fontWeight: 700, color: cashRemaining < 0 ? C.red : C.amber, marginTop: 8, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}><Plane size={13} color={C.amber} /> {fmtForeign(cashRemaining, cl.symbol, cl.code)} of {fmtForeign(cashLimitAmt, cl.symbol, cl.code)} cash left</div>}
             </div>
             {readOnly ? (
-              <div style={{ ...cardStyle, display:"flex", alignItems:"flex-start", gap:10, background:"rgba(34,211,238,0.06)", border:`1px solid rgba(34,211,238,0.25)` }}>
-                <CalendarDays size={17} color={C.accent2} style={{ marginTop:1, flexShrink:0 }} />
-                <div style={{ fontSize:13, color:C.text, lineHeight:1.45 }}>This is a <strong>combined monthly view</strong>. Add or edit purchases in the individual pay periods.</div>
+              <div style={{ ...cardStyle, display: "flex", alignItems: "flex-start", gap: 10, background: "rgba(34,211,238,0.06)", border: `1px solid rgba(34,211,238,0.25)` }}>
+                <CalendarDays size={17} color={C.accent2} style={{ marginTop: 1, flexShrink: 0 }} />
+                <div style={{ fontSize: 13, color: C.text, lineHeight: 1.45 }}>This is a <strong>combined monthly view</strong>. Purchases here are read-only — add or edit them in the individual pay periods.</div>
               </div>
             ) : (
-              <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
-                {travelOn && (
-                  <div style={{ display:"flex", alignItems:"center", gap:10, background:"rgba(251,191,36,0.07)", border:"1px solid rgba(251,191,36,0.28)", borderRadius:12, padding:"11px 14px" }}>
-                    <Plane size={16} color={C.amber} /><div style={{ flex:1, fontSize:13, fontWeight:600, color:C.amber }}>{fx.code} {cashOn?"cash allowance":"travel mode"}</div>
-                    <div style={{ textAlign:"right" }}>
-                      {cashOn && <div style={{ fontSize:12.5, fontWeight:700, color:cashRemaining<0?C.red:C.text }}>{fmtForeign(cashRemaining, fx.symbol, fx.code)} left</div>}
-                      <div style={{ fontSize:12, color:C.muted }}>1 USD = {fx.symbol}{(+effRate).toLocaleString(undefined,{maximumFractionDigits:2})}</div>
-                    </div>
-                  </div>
-                )}
-                <div style={cardStyle}>
-                  <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:12, gap:8 }}>
-                    <div style={{ fontSize:13, fontWeight:600, color:C.sub, letterSpacing:0.3 }}>ADD PURCHASE</div>
-                    {travelOn && (
-                      <div style={{ display:"flex", gap:6, flexShrink:0 }}>
-                        {curBtn(false, `${fx.symbol} ${fx.code}`)}
-                        {curBtn(true, "$ USD")}
-                      </div>
-                    )}
-                  </div>
-                  <div style={{ display:"flex", alignItems:"center", background:C.bg2, border:`1px solid ${C.border}`, borderRadius:11, padding:"0 14px", marginBottom:10 }}>
-                    <span style={{ color:C.muted, fontSize:18 }}>{currSymbol}</span>
-                    <input inputMode="decimal" value={amount} onChange={(e)=>{ const v=e.target.value; if(/^\d*\.?\d*$/.test(v)) setAmount(v); }} onKeyDown={(e)=>{ if(e.key==="Enter") handleAdd(); }} placeholder="0.00" style={{ background:"transparent", border:"none", outline:"none", color:C.text, fontSize:22, fontWeight:700, width:"100%", padding:"14px 6px" }} />
-                  </div>
-                  <input value={merchant} onChange={(e)=>setMerchant(e.target.value)} onKeyDown={(e)=>{ if(e.key==="Enter") handleAdd(); }} placeholder="Where? (optional)" style={{ width:"100%", background:C.bg2, border:`1px solid ${C.border}`, borderRadius:11, outline:"none", color:C.text, fontSize:15, padding:"13px 14px", marginBottom:recentMerchants.length&&!merchant?8:12 }} />
-                  {recentMerchants.length>0 && !merchant && (
-                    <div style={{ display:"flex", flexWrap:"wrap", gap:6, marginBottom:12 }}>
-                      {recentMerchants.map((m)=><button key={m} onClick={()=>setMerchant(m)} style={{ padding:"5px 11px", borderRadius:999, border:`1px solid ${C.border}`, background:C.bg2, color:C.sub, fontSize:12, fontWeight:600, cursor:"pointer" }}>{m}</button>)}
-                    </div>
-                  )}
-                  <div style={{ display:"flex", gap:8, marginBottom:12 }}>{pill("spending","Spending")}{pill("gas","Gas")}{pill("reimbursement","Refund")}{pill("gasReimbursement","Gas Refund")}</div>
-                  <button onClick={handleAdd} style={{ width:"100%", padding:"14px 0", borderRadius:12, border:"none", background:`linear-gradient(90deg, ${C.greenDim}, ${C.green})`, color:"#06281d", fontSize:15, fontWeight:700, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:6 }}><Plus size={18} /> {category==="reimbursement"?"Add reimbursement":category==="gasReimbursement"?"Add gas reimbursement":"Add purchase"}</button>
-                </div>
-              </div>
+              <AddPurchaseForm key={data.id} data={data} computed={computed} store={store} travel={travel} addTransaction={addTransaction} />
             )}
           </div>
 
-          <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
-            {data.transactions.length>5 && (
-              <div style={{ display:"flex", alignItems:"center", gap:9, background:C.card, border:`1px solid ${C.border}`, borderRadius:12, padding:"10px 14px" }}>
-                <Search size={15} color={C.muted} />
-                <input value={query} onChange={(e)=>setQuery(e.target.value)} placeholder="Search purchases…" style={{ flex:1, minWidth:0, background:"transparent", border:"none", outline:"none", color:C.text, fontSize:14 }} />
-                {query && <button onClick={()=>setQuery("")} style={{ background:"transparent", border:"none", color:C.muted, cursor:"pointer", display:"flex", padding:0 }} aria-label="Clear search"><X size={14} /></button>}
-              </div>
-            )}
-            <div style={cardStyle}>
-              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:4 }}>
-                <div style={{ fontSize:13, fontWeight:600, color:C.sub, letterSpacing:0.3 }}>SPENDING</div>
-                <div style={{ fontSize:13, color:C.sub }}>{fmt(spent)}</div>
-              </div>
-              {spendingTx.length===0 ? <div style={{ color:C.muted, fontSize:14, padding:"24px 0", textAlign:"center" }}>{q?"No matches.":"No purchases yet."}</div> : spendingTx.map((t)=><TxRow key={t.id} t={t} onRemove={removeTransaction} onUpdate={updateTransaction} readOnly={readOnly} />)}
-            </div>
-            {reimbTx.length>0 && (
-              <div style={cardStyle}>
-                <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:4 }}>
-                  <div style={{ fontSize:13, fontWeight:600, color:C.sub, letterSpacing:0.3, display:"flex", alignItems:"center", gap:6 }}><Reimburse size={14} color={C.green} /> REFUNDS</div>
-                  <div style={{ fontSize:13, color:C.green, fontWeight:700 }}>+{fmt(reimbursed)}</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+            {hasAnyTx && (
+              <div>
+                <div style={{ display: "flex", alignItems: "center", gap: 9, background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: "10px 14px" }}>
+                  <Search size={15} color={C.muted} />
+                  <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search purchases, categories, amounts…" style={{ flex: 1, minWidth: 0, background: "transparent", border: "none", outline: "none", color: C.text, fontSize: 14 }} />
+                  {query && <button onClick={() => setQuery("")} aria-label="Clear search" style={{ background: "transparent", border: "none", color: C.muted, cursor: "pointer", display: "flex", padding: 0 }}><X size={14} /></button>}
                 </div>
-                {reimbTx.map((t)=><TxRow key={t.id} t={t} onRemove={removeTransaction} onUpdate={updateTransaction} readOnly={readOnly} />)}
+                {q && <div style={{ display: "flex", gap: 6, marginTop: 8 }}>{scopeChip(!allPeriods, "This period", false)}{scopeChip(allPeriods, "All periods", true)}</div>}
               </div>
             )}
-            <div style={cardStyle}>
-              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:4 }}>
-                <div style={{ fontSize:13, fontWeight:600, color:C.sub, letterSpacing:0.3, display:"flex", alignItems:"center", gap:6 }}><Fuel size={14} color={C.accent2} /> GAS</div>
-                <div style={{ fontSize:13, color:remainingGas<0?C.red:C.sub }}>{fmt(gasSpent)}{gasReimbursed>0 && <span style={{ color:C.green }}> · +{fmt(gasReimbursed)} back</span>} · {fmt(remainingGas)} left</div>
+
+            {q && allPeriods ? (
+              <div style={cardStyle}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: C.sub, letterSpacing: 0.3 }}>ALL PERIODS</div>
+                  <div style={{ fontSize: 13, color: C.sub }}>{everywhere.length} match{everywhere.length === 1 ? "" : "es"}</div>
+                </div>
+                {everywhere.length === 0 ? <div style={{ color: C.muted, fontSize: 14, padding: "24px 0", textAlign: "center" }}>No matches.</div>
+                  : everywhere.map((t) => <TxRow key={t._pid + t.id} t={t} periodTag={t._pName} readOnly={t._archived} allocs={t._allocs}
+                      onRemove={(id) => removeTransaction(id, t._pid)} onUpdate={(id, patch) => updateTransaction(id, patch, t._pid)} />)}
               </div>
-              {gasTx.length===0 ? <div style={{ color:C.muted, fontSize:14, padding:"24px 0", textAlign:"center" }}>{q?"No matches.":"No gas logged yet."}</div> : gasTx.map((t)=><TxRow key={t.id} t={t} onRemove={removeTransaction} onUpdate={updateTransaction} readOnly={readOnly} />)}
-            </div>
+            ) : (
+              <React.Fragment>
+                <div style={cardStyle}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: C.sub, letterSpacing: 0.3 }}>SPENDING</div>
+                    <div style={{ fontSize: 13, color: C.sub }}>{fmt(spent)}</div>
+                  </div>
+                  {spendingTx.length === 0 ? <div style={{ color: C.muted, fontSize: 14, padding: "24px 0", textAlign: "center" }}>{q ? "No matches." : "No purchases yet."}</div>
+                    : <DayGroups txs={spendingTx} renderRow={(t) => <TxRow key={t.id} t={t} hideDate onRemove={removeTransaction} onUpdate={updateTransaction} readOnly={readOnly} allocs={spendAllocs} />} />}
+                </div>
+
+                {reimbTx.length > 0 && (
+                  <div style={cardStyle}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                      <div style={{ fontSize: 13, fontWeight: 600, color: C.sub, letterSpacing: 0.3, display: "flex", alignItems: "center", gap: 6 }}><Reimburse size={14} color={C.green} /> REFUNDS</div>
+                      <div style={{ fontSize: 13, color: C.green, fontWeight: 700 }}>+{fmt(reimbursed)}</div>
+                    </div>
+                    {reimbTx.map(row)}
+                  </div>
+                )}
+
+                <div style={cardStyle}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: C.sub, letterSpacing: 0.3, display: "flex", alignItems: "center", gap: 6 }}><Fuel size={14} color={C.accent2} /> GAS</div>
+                    <div style={{ fontSize: 13, color: remainingGas < 0 ? C.red : C.sub }}>{fmt(gasSpent)}{gasReimbursed > 0 && <span style={{ color: C.green }}> · +{fmt(gasReimbursed)} back</span>} · {fmt(remainingGas)} left</div>
+                  </div>
+                  {gasTx.length === 0 ? <div style={{ color: C.muted, fontSize: 14, padding: "24px 0", textAlign: "center" }}>{q ? "No matches." : "No gas logged yet."}</div> : gasTx.map(row)}
+                </div>
+              </React.Fragment>
+            )}
           </div>
         </div>
       );
     }
 
     /* ================= Calendar (global) ================= */
-    function CalendarView({ data, store }) {
+    function CalendarView({ data, store, onUpdateTx, onRemoveTx, onAddOnDay }) {
       const [viewMonth, setViewMonth] = useState(()=>startOfMonth(Date.now()));
       const [selectedKey, setSelectedKey] = useState(null);
       const todayKey = dayKey(Date.now());
       const navBtn = { width:38, height:38, borderRadius:10, border:`1px solid ${C.border}`, background:C.card, color:C.sub, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" };
-      const allTx = useMemo(()=>{ const txs=[]; store.periods.forEach((p)=>{ if(p.type!=="combined")(p.transactions||[]).forEach((t)=>txs.push({ ...t, _pName:p.period })); }); return txs; }, [store]);
-      const byDay = useMemo(()=>{ const m={}; allTx.forEach((t)=>{ const k=dayKey(t.date||Date.now()); if(!m[k])m[k]={total:0,items:[]}; m[k].total += isRefundCat(t.category)?-t.amount:t.amount; m[k].items.push(t); }); return m; }, [allTx]);
+      const allTx = useMemo(()=>{ const txs=[]; store.periods.forEach((p)=>{ if(p.type!=="combined")(p.transactions||[]).forEach((t)=>txs.push({ ...t, _pName:p.period, _pid:p.id, _archived:p.type==="archived", _allocs:p.spendingAllocations||[] })); }); return txs; }, [store]);
+      const byDay = useMemo(()=>{ const m={}; allTx.forEach((t)=>{ const k=dayKey(t.date||data.startDate); if(!m[k])m[k]={total:0,items:[]}; m[k].total += isRefundCat(t.category)?-t.amount:t.amount; m[k].items.push(t); }); return m; }, [allTx, data]);
       const d0 = new Date(viewMonth), year=d0.getFullYear(), month=d0.getMonth();
       const firstWeekday = new Date(year,month,1).getDay();
       const daysInMonth = new Date(year,month+1,0).getDate();
       const monthLabel = d0.toLocaleDateString("en-US",{month:"long",year:"numeric"});
       const periodStart = startOfDay(data.startDate), periodEndExcl = periodEnd(data);
       const maxDay = Math.max(1, ...Object.keys(byDay).map((k)=>byDay[k].total));
+      const dayAmt = (total) => (total < 0 ? "+$" : "$") + Math.round(Math.abs(total)); // a refund-heavy day nets positive
       let monthTotal = 0;
       Object.keys(byDay).forEach((k)=>{ const d=new Date(k.split("-")[0],k.split("-")[1]-1,k.split("-")[2]); if(d.getFullYear()===year&&d.getMonth()===month) monthTotal+=byDay[k].total; });
       const cells = [];
@@ -836,9 +1408,9 @@
         <div className="cal-grid">
           <div style={cardStyle}>
             <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:16 }}>
-              <button onClick={()=>shiftMonth(-1)} style={navBtn}><ChevronDown size={18} style={{ transform:"rotate(90deg)" }} /></button>
+              <button onClick={()=>shiftMonth(-1)} aria-label="Previous month" style={navBtn}><ChevronDown size={18} style={{ transform:"rotate(90deg)" }} /></button>
               <div style={{ textAlign:"center" }}><div style={{ fontSize:18, fontWeight:700, color:C.text }}>{monthLabel}</div><div style={{ fontSize:12.5, color:C.sub, marginTop:1 }}>{fmt(monthTotal)} spent · all periods</div></div>
-              <button onClick={()=>shiftMonth(1)} style={navBtn}><ChevronDown size={18} style={{ transform:"rotate(-90deg)" }} /></button>
+              <button onClick={()=>shiftMonth(1)} aria-label="Next month" style={navBtn}><ChevronDown size={18} style={{ transform:"rotate(-90deg)" }} /></button>
             </div>
             <div style={{ display:"grid", gridTemplateColumns:"repeat(7, 1fr)", gap:8, marginBottom:8 }}>
               {weekdays.map((w,i)=><div key={i} style={{ textAlign:"center", fontSize:11.5, fontWeight:600, color:C.muted }}>{w}</div>)}
@@ -850,12 +1422,12 @@
                 const ms = new Date(year,month,day).getTime();
                 const info = byDay[k];
                 const inPeriod = ms>=periodStart && ms<periodEndExcl;
-                const isToday = k===todayKey, isSel = k===selectedKey;
-                const intensity = info ? 0.12 + 0.33*Math.min(1, info.total/maxDay) : 0;
+                const isTodayCell = k===todayKey, isSel = k===selectedKey;
+                const intensity = info ? 0.12 + 0.33*Math.min(1, Math.max(0, info.total)/maxDay) : 0;
                 return (
-                  <button key={i} onClick={()=>setSelectedKey(isSel?null:k)} className="hoverable" style={{ aspectRatio:"1 / 1", borderRadius:11, cursor:"pointer", padding:4, border: isSel?`2px solid ${C.green}`:(isToday?`1px solid ${C.accent}`:`1px solid ${inPeriod?C.border:"transparent"}`), background: info?`rgba(52,211,153,${intensity})`:(inPeriod?C.cardHi:"transparent"), display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:2 }}>
-                    <span style={{ fontSize:14, fontWeight:isToday?800:600, color:isToday?C.accent:C.text }}>{day}</span>
-                    {info && <span style={{ fontSize:10, fontWeight:700, color: info.total<0?C.green:C.green, lineHeight:1 }}>{info.total<0?"+":""}${Math.abs(Math.round(info.total))}</span>}
+                  <button key={i} onClick={()=>setSelectedKey(isSel?null:k)} className="hoverable" style={{ aspectRatio:"1 / 1", borderRadius:11, cursor:"pointer", padding:4, border: isSel?`2px solid ${C.green}`:(isTodayCell?`1px solid ${C.accent}`:`1px solid ${inPeriod?C.border:"transparent"}`), background: info?`rgba(52,211,153,${intensity})`:(inPeriod?C.cardHi:"transparent"), display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:2 }}>
+                    <span style={{ fontSize:14, fontWeight:isTodayCell?800:600, color:isTodayCell?C.accent:C.text }}>{day}</span>
+                    {info && <span style={{ fontSize:10, fontWeight:700, color:C.green, lineHeight:1 }}>{dayAmt(info.total)}</span>}
                   </button>
                 );
               })}
@@ -871,24 +1443,23 @@
               <React.Fragment>
                 <div style={{ display:"flex", alignItems:"baseline", justifyContent:"space-between", marginBottom:12 }}>
                   <div style={{ fontSize:16, fontWeight:700, color:C.text }}>{new Date(selectedKey.split("-")[0],selectedKey.split("-")[1]-1,selectedKey.split("-")[2]).toLocaleDateString("en-US",{weekday:"long",month:"short",day:"numeric"})}</div>
-                  <div style={{ fontSize:15, fontWeight:700, color:selected?C.green:C.muted }}>{fmt(selected?selected.total:0)}</div>
+                  <div style={{ fontSize:15, fontWeight:700, color:selected?C.green:C.muted }}>{selected && selected.total < 0 ? "+"+fmt(-selected.total) : fmt(selected?selected.total:0)}</div>
                 </div>
                 {dayPeriods.length > 0 && (
-                  <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:14, fontSize:12, color:C.sub }}>
+                  <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:8, fontSize:12, color:C.sub }}>
                     <CalendarDays size={13} color={C.muted} />
                     <span>From {dayPeriods.length===1 ? dayPeriods[0] : dayPeriods.length+" pay periods"}</span>
                   </div>
                 )}
-                {selected && selected.items.length ? selected.items.map((t)=>{ const isReimb=isRefundCat(t.category); const showTag = dayPeriods.length>1 && t._pName; return (
-                  <div key={t.id} style={{ display:"flex", alignItems:"center", padding:"11px 0", borderBottom:`1px solid ${C.border}` }}>
-                    <div style={{ width:32, height:32, borderRadius:9, background: isReimb?"rgba(52,211,153,0.15)":(t.category==="gas"?"rgba(34,211,238,0.12)":"rgba(129,140,248,0.12)"), display:"flex", alignItems:"center", justifyContent:"center", marginRight:11, flexShrink:0 }}>{isReimb?(t.category==="gasReimbursement"?<Fuel size={15} color={C.green} />:<Reimburse size={15} color={C.green} />):(t.category==="gas"?<Fuel size={15} color={C.accent2} />:<Receipt size={15} color={C.accent} />)}</div>
-                    <div style={{ flex:1, minWidth:0 }}>
-                      <div style={{ fontSize:14, color:C.text }}>{t.merchant}</div>
-                      {showTag && <div style={{ fontSize:11.5, color:C.muted, marginTop:1, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{t._pName}</div>}
-                    </div>
-                    <div style={{ fontSize:14.5, fontWeight:700, color:isReimb?C.green:C.text, marginLeft:8 }}>{isReimb?"+":""}{fmt(t.amount)}</div>
-                  </div>
-                ); }) : <div style={{ color:C.muted, fontSize:14, padding:"24px 0", textAlign:"center" }}>No purchases on this day.</div>}
+                {selected && selected.items.length ? newestFirst(selected.items).map((t)=>(
+                  <TxRow key={t._pid+t.id} t={t} hideDate periodTag={dayPeriods.length>1 ? t._pName : null} readOnly={t._archived} allocs={t._allocs}
+                    onRemove={(id)=>onRemoveTx(id, t._pid)} onUpdate={(id, patch)=>onUpdateTx(id, patch, t._pid)} />
+                )) : <div style={{ color:C.muted, fontSize:14, padding:"24px 0", textAlign:"center" }}>No purchases on this day.</div>}
+                {onAddOnDay && (
+                  <button onClick={()=>onAddOnDay(fromDateInput(selectedKey))} style={{ width:"100%", padding:"11px 0", borderRadius:11, border:`1px dashed ${C.borderHi}`, background:"transparent", color:C.sub, fontSize:13.5, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:6, marginTop:12 }}>
+                    <Plus size={16} /> Add purchase on this day
+                  </button>
+                )}
               </React.Fragment>
             ) : <div style={{ color:C.muted, fontSize:14, padding:"40px 0", textAlign:"center" }}>Select a day to see its purchases.<br/>The calendar shows spending across <strong>all</strong> your pay periods.</div>}
           </div>
@@ -911,21 +1482,94 @@
         </div>
       );
     }
-    function RecurringRow({ r, onUpdate, onRemove }) {
+    function RecurringRow({ r, onUpdate, onRemove, categoryNames = [] }) {
       const [amt, setAmt] = useState(r.amount ? String(r.amount) : "");
+      const sel = { background:C.bg2, border:`1px solid ${C.border}`, borderRadius:8, color:C.sub, fontSize:12, fontWeight:600, padding:"6px 8px", outline:"none", maxWidth:"100%", cursor:"pointer" };
+      const isGas = r.category === "gas";
       return (
-        <div style={{ display:"flex", alignItems:"center", gap:8, padding:"9px 0", borderBottom:`1px solid ${C.border}` }}>
-          <span style={{ color:C.muted, display:"flex", flexShrink:0 }}><Repeat size={15} /></span>
-          <input value={r.merchant} onChange={(e)=>onUpdate(r.id,{ merchant:e.target.value })} placeholder="Name (e.g. Netflix)" style={{ flex:1, minWidth:0, background:C.bg2, border:`1px solid ${C.border}`, borderRadius:10, outline:"none", color:C.text, fontSize:14, padding:"9px 10px" }} />
-          <div style={{ display:"flex", alignItems:"center", background:C.bg2, border:`1px solid ${C.border}`, borderRadius:10, padding:"0 8px", width:110, flexShrink:0 }}>
-            <span style={{ color:C.muted, fontSize:13 }}>$</span>
-            <input inputMode="decimal" value={amt} onChange={(e)=>{ const v=e.target.value; if(!/^\d*\.?\d*$/.test(v))return; setAmt(v); const n=v===""||v==="."?0:parseFloat(v); onUpdate(r.id,{ amount:isNaN(n)?0:n }); }} placeholder="0.00" style={{ background:"transparent", border:"none", outline:"none", color:C.text, fontSize:14, fontWeight:600, width:"100%", textAlign:"right", padding:"9px 2px" }} />
+        <div style={{ padding:"9px 0", borderBottom:`1px solid ${C.border}` }}>
+          <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+            <span style={{ color:C.muted, display:"flex", flexShrink:0 }}>{isGas ? <Fuel size={15} /> : <Repeat size={15} />}</span>
+            <input value={r.merchant} onChange={(e)=>onUpdate(r.id,{ merchant:e.target.value })} placeholder="Name (e.g. Netflix)" style={{ flex:1, minWidth:0, background:C.bg2, border:`1px solid ${C.border}`, borderRadius:10, outline:"none", color:C.text, fontSize:14, padding:"9px 10px" }} />
+            <div style={{ display:"flex", alignItems:"center", background:C.bg2, border:`1px solid ${C.border}`, borderRadius:10, padding:"0 8px", width:110, flexShrink:0 }}>
+              <span style={{ color:C.muted, fontSize:13 }}>$</span>
+              <input inputMode="decimal" value={amt} onChange={(e)=>{ const v=e.target.value; if(!/^\d*\.?\d*$/.test(v))return; setAmt(v); const n=v===""||v==="."?0:parseFloat(v); onUpdate(r.id,{ amount:isNaN(n)?0:n }); }} placeholder="0.00" style={{ background:"transparent", border:"none", outline:"none", color:C.text, fontSize:14, fontWeight:600, width:"100%", textAlign:"right", padding:"9px 2px" }} />
+            </div>
+            <button onClick={()=>onRemove(r.id)} aria-label="Remove recurring expense" title="Remove" style={{ width:30, height:30, borderRadius:8, border:"none", background:"transparent", color:C.muted, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}><X size={15} /></button>
           </div>
-          <button onClick={()=>onRemove(r.id)} style={{ width:30, height:30, borderRadius:8, border:"none", background:"transparent", color:C.muted, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}><X size={15} /></button>
+          <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginTop:7, paddingLeft:23 }}>
+            <select value={isGas ? "gas" : "spending"} onChange={(e)=>onUpdate(r.id, { category:e.target.value })} aria-label="Type" style={sel}>
+              <option value="spending">Spending</option>
+              <option value="gas">Gas</option>
+            </select>
+            <select value={r.freq === "monthly" ? String(r.day||1) : "period"} aria-label="When"
+              onChange={(e)=>onUpdate(r.id, e.target.value === "period" ? { freq:"period" } : { freq:"monthly", day:parseInt(e.target.value, 10) })} style={sel}>
+              <option value="period">Every pay period</option>
+              {Array.from({ length:31 }, (_, i)=>i+1).map((n)=><option key={n} value={String(n)}>Monthly on the {ordinal(n)}</option>)}
+            </select>
+            {!isGas && (categoryNames.length > 0 || r.allocName) && (
+              <select value={r.allocName || ""} onChange={(e)=>onUpdate(r.id, { allocName:e.target.value || undefined })} aria-label="Category" style={sel}>
+                <option value="">Other</option>
+                {Array.from(new Set([...categoryNames, ...(r.allocName ? [r.allocName] : [])])).map((n)=><option key={n} value={n}>{n}</option>)}
+              </select>
+            )}
+          </div>
         </div>
       );
     }
-    function BudgetView({ data, update, clearTransactions, computed, addAllocation, updateAllocation, removeAllocation, readOnly, travel, recurring, addRecurring, updateRecurring, removeRecurring, applyRecurring }) {
+
+    // Spending categories editor — splits the spending limit into categories (Budget tab).
+    function SpendCategoriesCard({ data, computed, readOnly, addSpendAlloc, updateSpendAlloc, removeSpendAlloc }) {
+      const [colorFor, setColorFor] = useState(null);
+      const { spendingLimit, spendAllocTotal, unallocatedSpending, catSpent } = computed;
+      const spendAllocs = data.spendingAllocations || [];
+      const overAlloc = unallocatedSpending < -0.004;
+      const usedNames = new Set(spendAllocs.map((a)=>(a.name||"").trim().toLowerCase()));
+      const suggestions = SPEND_SUGGESTIONS.filter((n)=>!usedNames.has(n.toLowerCase())).slice(0, 4);
+      const colorAlloc = colorFor && spendAllocs.find((a)=>a.id===colorFor);
+      return (
+        <div id="spend-categories" style={cardStyle}>
+          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:4 }}>
+            <div style={{ fontSize:13, fontWeight:600, color:C.sub, letterSpacing:0.3, display:"flex", alignItems:"center", gap:6 }}><Grid size={14} color={C.accent} /> SPENDING CATEGORIES</div>
+            <div style={{ fontSize:12, color:C.sub }}>Limit {fmt(spendingLimit)}</div>
+          </div>
+          <div style={{ fontSize:12, color:C.muted, lineHeight:1.45, marginBottom:6 }}>
+            {readOnly ? "Monthly view — categories from each pay period, combined. Edit them in a single pay period." : "Split your spending limit into categories, then tag purchases with them. Going over a category takes the extra from Other. Click a color to change it."}
+          </div>
+          {spendAllocs.map((a)=><SpendAllocRow key={a.id} a={a} spent={(catSpent && catSpent[a.id])||0} onUpdate={updateSpendAlloc} onRemove={removeSpendAlloc} onColor={setColorFor} readOnly={readOnly} />)}
+          {!readOnly && (
+            <React.Fragment>
+              <button onClick={()=>addSpendAlloc("")} style={{ width:"100%", padding:"11px 0", borderRadius:11, border:`1px dashed ${C.borderHi}`, background:"transparent", color:C.sub, fontSize:13.5, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:6, marginTop:12 }}>
+                <Plus size={16} /> Add category
+              </button>
+              {suggestions.length > 0 && (
+                <div style={{ display:"flex", flexWrap:"wrap", gap:7, justifyContent:"center", marginTop:10 }}>
+                  {suggestions.map((n)=>(
+                    <button key={n} onClick={()=>addSpendAlloc(n)} style={{ padding:"6px 11px", borderRadius:99, border:`1px solid ${C.border}`, background:C.cardHi, color:C.sub, fontSize:12, fontWeight:600, cursor:"pointer" }}>+ {n}</button>
+                  ))}
+                </div>
+              )}
+            </React.Fragment>
+          )}
+          <div style={{ marginTop:14, background:C.cardHi, borderRadius:12, padding:"10px 14px" }}>
+            <div style={{ display:"flex", justifyContent:"space-between", fontSize:13.5, padding:"3px 0" }}><span style={{ color:C.sub }}>Allocated</span><span style={{ fontWeight:600 }}>{fmt(spendAllocTotal)}</span></div>
+            <div style={{ display:"flex", justifyContent:"space-between", fontSize:14.5, padding:"3px 0" }}>
+              <span style={{ color:C.text, fontWeight:700 }}>{overAlloc ? "Over by" : "Unallocated (Other)"}</span>
+              <span style={{ fontWeight:800, color: overAlloc?C.red:C.green }}>{fmt(Math.abs(unallocatedSpending))}</span>
+            </div>
+          </div>
+          {overAlloc && (
+            <div style={{ marginTop:12, display:"flex", gap:9, alignItems:"flex-start", background:"rgba(248,113,113,0.1)", border:"1px solid rgba(248,113,113,0.3)", borderRadius:12, padding:"10px 12px" }}>
+              <AlertTriangle size={15} color={C.red} style={{ marginTop:1, flexShrink:0 }} />
+              <div style={{ fontSize:12.5, color:C.text, lineHeight:1.45 }}>Your categories add up to more than your spending limit. Lower a category or free up money above.</div>
+            </div>
+          )}
+          {colorAlloc && <SpendColorModal alloc={colorAlloc} others={spendAllocs.filter((a)=>a.id!==colorAlloc.id)} onPick={(col)=>updateSpendAlloc(colorAlloc.id, { color:col })} onClose={()=>setColorFor(null)} />}
+        </div>
+      );
+    }
+
+    function BudgetView({ data, update, clearTransactions, computed, addAllocation, updateAllocation, removeAllocation, readOnly, travel, recurring, addRecurring, updateRecurring, removeRecurring, applyRecurring, addSpendAlloc, updateSpendAlloc, removeSpendAlloc }) {
       const [confirming, setConfirming] = useState(false);
       const len = data.lengthDays || 14;
       const cl = data.cashLimit || { enabled:false, standalone:false, code:"JPY", symbol:"¥", amount:0, rate:150 };
@@ -970,9 +1614,12 @@
           <div className="two-col">
             <div style={{ ...cardStyle, display:"flex", alignItems:"flex-start", gap:10, background:"rgba(34,211,238,0.06)", border:`1px solid rgba(34,211,238,0.25)` }}>
               <CalendarDays size={17} color={C.accent2} style={{ marginTop:1, flexShrink:0 }} />
-              <div style={{ fontSize:13, color:C.text, lineHeight:1.45 }}>Combined monthly view of <strong>{(data.sourceNames||[]).join(" + ")}</strong>. Edit each period individually.</div>
+              <div style={{ fontSize:13, color:C.text, lineHeight:1.45 }}>Combined monthly view of <strong>{(data.sourceNames||[]).join(" + ")}</strong>. The budget is the total of those periods — edit each one in its own pay period.</div>
             </div>
-            {limitCard}
+            <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
+              {limitCard}
+              {(data.spendingAllocations||[]).length > 0 && <SpendCategoriesCard data={data} computed={computed} readOnly />}
+            </div>
           </div>
         );
       }
@@ -983,16 +1630,20 @@
               <div style={{ ...sectionTitle, marginBottom:10 }}>PERIOD</div>
               <input value={data.period} onChange={(e)=>update({ period:e.target.value })} placeholder="Period name" style={{ width:"100%", background:C.bg2, border:`1px solid ${C.border}`, borderRadius:11, outline:"none", color:C.text, fontSize:15, padding:"12px 14px", marginBottom:12 }} />
               <div style={{ fontSize:12, color:C.muted, marginBottom:6 }}>Start date</div>
-              <input type="date" value={toDateInput(data.startDate)} onChange={(e)=>update({ startDate:fromDateInput(e.target.value) })} style={{ width:"100%", background:C.bg2, border:`1px solid ${C.border}`, borderRadius:11, outline:"none", color:C.text, fontSize:15, padding:"11px 14px" }} />
+              <input type="date" value={toDateInput(data.startDate)} onChange={(e)=>{ if (!e.target.value) return; const v = fromDateInput(e.target.value); update({ startDate:v, ...(data.monthly ? { lengthDays:monthLength(v) } : {}) }); }} style={{ width:"100%", background:C.bg2, border:`1px solid ${C.border}`, borderRadius:11, outline:"none", color:C.text, fontSize:15, padding:"11px 14px" }} />
               <div style={{ fontSize:12, color:C.muted, margin:"14px 0 6px" }}>Length</div>
               <div style={{ display:"flex", gap:8, marginBottom:10 }}>
-                {LENGTH_PRESETS.map((pr)=><button key={pr.d} onClick={()=>update({ lengthDays:pr.d })} style={{ flex:1, minWidth:0, padding:"9px 0", borderRadius:10, border:`1px solid ${len===pr.d?C.green:C.border}`, background:len===pr.d?"rgba(52,211,153,0.12)":C.bg2, color:len===pr.d?C.text:C.sub, fontSize:12.5, fontWeight:600, cursor:"pointer" }}>{pr.label}</button>)}
+                {LENGTH_PRESETS.map((pr)=>{
+                  const on = pr.monthly ? !!data.monthly : !data.monthly && len===pr.d;
+                  return <button key={pr.label} onClick={()=>update(pr.monthly ? { monthly:true, lengthDays:monthLength(data.startDate) } : { monthly:false, lengthDays:pr.d })} style={{ flex:1, minWidth:0, padding:"9px 0", borderRadius:10, border:`1px solid ${on?C.green:C.border}`, background:on?"rgba(52,211,153,0.12)":C.bg2, color:on?C.text:C.sub, fontSize:12.5, fontWeight:600, cursor:"pointer" }}>{pr.label}</button>;
+                })}
               </div>
               <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", background:C.bg2, border:`1px solid ${C.border}`, borderRadius:11, padding:8 }}>
-                <button onClick={()=>update({ lengthDays:Math.max(3,len-1) })} style={stepBtn}>−</button>
+                <button onClick={()=>update({ monthly:false, lengthDays:Math.max(3,len-1) })} aria-label="Shorter" style={stepBtn}>−</button>
                 <div style={{ textAlign:"center" }}><div style={{ fontSize:17, fontWeight:700, color:C.text }}>{len} days</div><div style={{ fontSize:11.5, color:C.muted }}>{periodRangeLabel(data)}</div></div>
-                <button onClick={()=>update({ lengthDays:Math.min(31,len+1) })} style={stepBtn}>＋</button>
+                <button onClick={()=>update({ monthly:false, lengthDays:Math.min(31,len+1) })} aria-label="Longer" style={stepBtn}>＋</button>
               </div>
+              <div style={{ fontSize:11.5, color:C.muted, textAlign:"center", marginTop:8 }}>{data.monthly ? "Monthly follows the calendar — the next period starts on the same date next month." : "Anywhere from 3 days to 1 month (31 days)."}</div>
             </div>
             <div style={cardStyle}>
               <div style={sectionTitle}>INCOME</div>
@@ -1006,11 +1657,12 @@
               <NumberField label="Insurance" icon={<Shield size={15} />} value={data.insurance} onChange={(v)=>update({ insurance:v })} />
               {(data.allocations||[]).map((a)=><AllocationRow key={a.id} a={a} onUpdate={updateAllocation} onRemove={removeAllocation} />)}
               <button onClick={()=>addAllocation("")} style={{ width:"100%", padding:"11px 0", borderRadius:11, border:`1px dashed ${C.borderHi}`, background:"transparent", color:C.sub, fontSize:13.5, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:6, marginTop:12 }}><Plus size={16} /> Add allocation</button>
+              <div style={{ fontSize:11.5, color:C.muted, marginTop:8, textAlign:"center" }}>Add custom set-asides like rent, groceries, subscriptions…</div>
             </div>
             <div style={cardStyle}>
               <div style={{ ...sectionTitle, display:"flex", alignItems:"center", gap:6 }}><Repeat size={14} color={C.accent} /> RECURRING EXPENSES</div>
-              <div style={{ fontSize:12, color:C.muted, marginBottom:4, lineHeight:1.45 }}>Subscriptions and bills logged automatically as purchases in every new pay period.</div>
-              {(recurring||[]).map((r)=><RecurringRow key={r.id} r={r} onUpdate={updateRecurring} onRemove={removeRecurring} />)}
+              <div style={{ fontSize:12, color:C.muted, marginBottom:4, lineHeight:1.45 }}>Bills and subscriptions logged automatically in each new pay period — every period, or monthly on a set day (only in the period that day falls in).</div>
+              {(recurring||[]).map((r)=><RecurringRow key={r.id} r={r} onUpdate={updateRecurring} onRemove={removeRecurring} categoryNames={(data.spendingAllocations||[]).map((a)=>(a.name||"").trim()).filter(Boolean)} />)}
               <button onClick={addRecurring} style={{ width:"100%", padding:"11px 0", borderRadius:11, border:`1px dashed ${C.borderHi}`, background:"transparent", color:C.sub, fontSize:13.5, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:6, marginTop:12 }}><Plus size={16} /> Add recurring expense</button>
               {(recurring||[]).some((r)=>r.amount>0) && (
                 <button onClick={applyRecurring} style={{ width:"100%", padding:"10px 0", borderRadius:11, border:`1px solid ${C.border}`, background:"transparent", color:C.sub, fontSize:13, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:6, marginTop:8 }}><Plus size={15} /> Add missing ones to this period now</button>
@@ -1020,6 +1672,7 @@
               <div style={sectionTitle}>END GOAL</div>
               <NumberField label="Amount to keep" sublabel="left over at the end of the period" icon={<Target size={15} />} value={data.endGoal} onChange={(v)=>update({ endGoal:v })} />
             </div>
+            <SpendCategoriesCard data={data} computed={computed} addSpendAlloc={addSpendAlloc} updateSpendAlloc={updateSpendAlloc} removeSpendAlloc={removeSpendAlloc} />
             <div style={cardStyle}>
               <div style={{ ...sectionTitle, marginBottom:12, display:"flex", alignItems:"center", gap:6 }}><Plane size={14} color={C.amber} /> TRAVEL CASH</div>
               <div style={{ display:"flex", alignItems:"center", gap:12 }}>
@@ -1053,7 +1706,7 @@
                     </div>
                     <button onClick={()=>setCash({ standalone:!cl.standalone })} style={toggleStyle(cl.standalone, C.amber)}><div style={knobStyle(cl.standalone)} /></button>
                   </div>
-                  <div style={{ fontSize:11.5, color:C.muted, marginTop:14, lineHeight:1.5 }}>Its USD value{computed.cashSetAside > 0 ? ` (${fmt(computed.cashSetAside)})` : ""} is set aside from your spending limit up front. {cl.code} purchases are then tracked only against this cash — they don't touch your USD limit. Both circles show on the Dashboard.</div>
+                  <div style={{ fontSize:11.5, color:C.muted, marginTop:14, lineHeight:1.5 }}>Its USD value{computed.cashSetAside > 0 ? ` (${fmt(computed.cashSetAside)})` : ""} is set aside from your spending limit up front. {cl.code} purchases are then tracked only against this cash — they don't touch your USD limit. Both rings show on the Dashboard.</div>
                 </div>
               )}
             </div>
@@ -1062,6 +1715,7 @@
             {limitCard}
             <div style={cardStyle}>
               <button onClick={()=>setConfirming(true)} style={{ width:"100%", padding:"12px 0", borderRadius:12, border:`1px solid ${C.border}`, background:"transparent", color:C.sub, fontSize:14, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:8 }}><RotateCcw size={16} /> Clear purchases in this period</button>
+              <div style={{ fontSize:12, color:C.muted, textAlign:"center", marginTop:12 }}>To start a fresh pay period, open the period picker in the sidebar → New pay period.</div>
             </div>
           </div>
           {confirming && <ConfirmModal title="Clear all purchases?" message="Are you sure? This action cannot be undone." confirmLabel="Clear" onCancel={()=>setConfirming(false)} onConfirm={()=>{ clearTransactions(); setConfirming(false); }} />}
@@ -1069,8 +1723,35 @@
       );
     }
 
+    function CarryToggle({ on, setOn, amount, style }) {
+      if (!(amount > 0)) return null;
+      return (
+        <button onClick={()=>setOn(!on)} style={{ width:"100%", display:"flex", alignItems:"center", gap:10, padding:"10px 12px", borderRadius:11, border:`1px solid ${C.border}`, background:"transparent", cursor:"pointer", textAlign:"left", ...style }}>
+          <span style={{ width:20, height:20, borderRadius:6, border:`2px solid ${on?C.green:C.borderHi}`, background:on?C.green:"transparent", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>{on && <Check size={13} color="#06281d" strokeWidth={3} />}</span>
+          <span style={{ fontSize:13, color:C.text, lineHeight:1.35 }}>Carry over <strong>{fmt(amount)}</strong> left as the next starting balance</span>
+        </button>
+      );
+    }
+
+    function PeriodEndedCard({ period, carry, setCarry, carryAmount, onStart }) {
+      return (
+        <div style={{ ...cardStyle, marginBottom:20, background:"rgba(251,191,36,0.07)", border:"1px solid rgba(251,191,36,0.3)", display:"flex", alignItems:"center", gap:18, flexWrap:"wrap" }}>
+          <div style={{ flex:"1 1 280px", minWidth:0 }}>
+            <div style={{ display:"flex", alignItems:"center", gap:8, fontSize:15, fontWeight:700, color:C.text, marginBottom:4 }}><CalendarDays size={17} color={C.amber} /> Pay period ended</div>
+            <div style={{ fontSize:13, color:C.sub, lineHeight:1.45 }}><strong style={{ color:C.text }}>{period.period}</strong> ended {fmtMonthDay(periodEnd(period)-1)}. Start the next one with the same budget?</div>
+          </div>
+          <div style={{ flex:"1 1 300px", display:"flex", flexDirection:"column", gap:10 }}>
+            <CarryToggle on={carry} setOn={setCarry} amount={carryAmount} />
+            <button onClick={onStart} style={{ width:"100%", padding:"12px 0", borderRadius:12, border:"none", background:`linear-gradient(90deg, ${C.greenDim}, ${C.green})`, color:"#06281d", fontSize:14.5, fontWeight:700, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:6 }}>
+              <Plus size={17} /> Start next period · {fmtMonthDay(periodEnd(period))}
+            </button>
+          </div>
+        </div>
+      );
+    }
+
     /* ================= Period modal ================= */
-    function PeriodModal({ store, onClose, onSwitch, onCreate, onDelete, onCombine, onArchive }) {
+    function PeriodModal({ store, onClose, onSwitch, onCreate, onDelete, onCombine, onArchive, carry, setCarry, carryAmount }) {
       const [confirmId, setConfirmId] = useState(null);
       const [archiveId, setArchiveId] = useState(null);
       const [archivedOpen, setArchivedOpen] = useState(false);
@@ -1163,8 +1844,10 @@
               </React.Fragment>
             ) : (
               <React.Fragment>
+                <CarryToggle on={carry} setOn={setCarry} amount={carryAmount} style={{ marginBottom:8 }} />
                 <button onClick={onCreate} style={{ width:"100%", padding:"14px 0", borderRadius:12, border:"none", background:`linear-gradient(90deg, ${C.greenDim}, ${C.green})`, color:"#06281d", fontSize:15, fontWeight:700, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:8 }}><Plus size={18} /> New pay period</button>
                 {singleCount>=2 && <button onClick={()=>{ setCombining(true); setSelected([]); setConfirmId(null); }} style={{ width:"100%", padding:"12px 0", borderRadius:12, border:`1px solid ${C.border}`, background:"transparent", color:C.sub, fontSize:14, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:8, marginTop:8 }}><CalendarDays size={16} /> Combine periods into a month</button>}
+                <div style={{ fontSize:11.5, color:C.muted, textAlign:"center", marginTop:10 }}>New periods copy your current budget and categories{carry && carryAmount > 0 ? " and start with what's left" : ""}. Combined months stay viewable, and so do the originals.</div>
               </React.Fragment>
             )}
           </div>
@@ -1180,6 +1863,36 @@
         )}
         </React.Fragment>
       );
+    }
+
+    /* ================= Files (backup / restore / CSV) ================= */
+    function saveTextFile(name, mime, text) {
+      const url = URL.createObjectURL(new Blob([text], { type: mime }));
+      const a = document.createElement("a");
+      a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+    }
+    function openTextFile(onText) {
+      const input = document.createElement("input");
+      input.type = "file"; input.accept = ".json,application/json,text/plain";
+      input.onchange = () => { const f = input.files && input.files[0]; if (!f) return; const r = new FileReader(); r.onload = () => onText(String(r.result)); r.readAsText(f); };
+      input.click();
+    }
+    // Every purchase in every period, oldest first. Refunds are negative so a column sum is net spending.
+    function purchasesCsv(store) {
+      const q = (v) => { const x = v == null ? "" : String(v); return /[",\r\n]/.test(x) ? '"' + x.replace(/"/g, '""') + '"' : x; };
+      const rows = [];
+      store.periods.forEach((p) => {
+        if (p.type === "combined") return;
+        const names = {};
+        (p.spendingAllocations || []).forEach((a) => { names[a.id] = a.name; });
+        (p.transactions || []).forEach((t) => rows.push({ t, p, cat: (t.allocId && names[t.allocId]) || "" }));
+      });
+      rows.sort((a, b) => (a.t.date || 0) - (b.t.date || 0));
+      const out = [["Date", "Pay period", "Merchant", "Type", "Category", "Amount (USD)", "Foreign amount", "Currency"]];
+      rows.forEach(({ t, p, cat }) => out.push([toDateInput(t.date || p.startDate), p.period, t.merchant, catLabel(t.category), cat,
+        ((isRefundCat(t.category) ? -1 : 1) * t.amount).toFixed(2), t.foreignAmount || "", t.foreignCode || ""]));
+      return out.map((r) => r.map(q).join(",")).join("\r\n") + "\r\n";
     }
 
     /* ================= Backup modal ================= */
@@ -1211,10 +1924,11 @@
     }
 
     /* ================= Settings modal ================= */
-    function SettingsModal({ themeMode, setThemeMode, accent, setAccent, store, onReset, onRestore, onClose, travel, setTravel }) {
+    function SettingsModal({ themeMode, setThemeMode, accent, setAccent, store, onReset, onRestore, onClose, travel, setTravel, user, showToast }) {
       const [confirmReset, setConfirmReset] = useState(false);
       const [backupOpen, setBackupOpen] = useState(false);
       const [rateText, setRateText] = useState(String(travel.rate||150));
+      useEffect(()=>{ setRateText(String(travel.rate||150)); }, [travel.code, travel.rate]);
       const themeOpts = [{ id:"light", label:"Light", Ico:Sun },{ id:"dark", label:"Dark", Ico:Moon },{ id:"oled", label:"OLED", Ico:Contrast }];
       const sectionLabel = { fontSize:12, fontWeight:700, color:C.muted, letterSpacing:0.5, marginBottom:10, marginTop:4 };
       const rowBtn = { width:"100%", display:"flex", alignItems:"center", gap:12, padding:"14px 16px", borderRadius:12, border:`1px solid ${C.border}`, background:C.card, fontSize:14.5, fontWeight:600, cursor:"pointer" };
@@ -1267,20 +1981,33 @@
                   <div style={{ fontSize:12, color:C.muted, margin:"14px 0 8px" }}>Exchange rate</div>
                   <div style={{ display:"flex", alignItems:"center", gap:8, background:C.bg2, border:`1px solid ${C.border}`, borderRadius:11, padding:"12px 14px" }}>
                     <span style={{ fontSize:13.5, color:C.sub, flexShrink:0 }}>1 USD =</span>
-                    <input inputMode="decimal" value={rateText} onChange={(e)=>{ const v=e.target.value; if(!/^\d*\.?\d*$/.test(v))return; setRateText(v); const n=parseFloat(v); if(!isNaN(n)&&n>0) setTravel((t)=>({ ...t, rate:n, rateUpdated:Date.now() })); }} style={{ flex:1, background:"transparent", border:"none", outline:"none", color:C.text, fontSize:17, fontWeight:700, textAlign:"right" }} />
+                    <input inputMode="decimal" value={rateText} onChange={(e)=>{ const v=e.target.value; if(!/^\d*\.?\d*$/.test(v))return; setRateText(v); const n=parseFloat(v); if(!isNaN(n)&&n>0) setTravel((t)=>({ ...t, rate:n, rateUpdated:Date.now(), rateSource:"manual", rateCode:t.code })); }} style={{ flex:1, background:"transparent", border:"none", outline:"none", color:C.text, fontSize:17, fontWeight:700, textAlign:"right" }} />
                     <span style={{ fontSize:14, fontWeight:700, color:C.amber, flexShrink:0 }}>{travel.symbol}</span>
                   </div>
-                  <div style={{ fontSize:11.5, color:C.muted, marginTop:7 }}>Set the rate manually — update it daily. Also editable on the Convert tab.</div>
+                  <div style={{ fontSize:11.5, color:C.muted, marginTop:7, lineHeight:1.45 }}>{rateStatus(travel).label}. Today's rate is fetched automatically when you're online; a rate you type in is kept for the rest of the day. Also editable on the Convert tab.</div>
                 </div>
               )}
             </div>
             <div style={sectionLabel}>DATA</div>
-            <button onClick={()=>setBackupOpen(true)} style={{ ...rowBtn, color:C.text, marginBottom:10 }}><Download size={18} color={C.accent2} /> Backup &amp; restore<span style={{ marginLeft:"auto", color:C.muted, fontSize:12.5, fontWeight:500 }}>Save or paste a copy</span></button>
+            <button onClick={()=>{ saveTextFile("weekly-budget-backup-"+toDateInput(Date.now())+".json", "application/json", JSON.stringify(store)); showToast("Backup saved", null); }} style={{ ...rowBtn, color:C.text, marginBottom:10 }}>
+              <Download size={18} color={C.accent2} /> Save backup file<span style={{ marginLeft:"auto", color:C.muted, fontSize:12.5, fontWeight:500 }}>.json</span>
+            </button>
+            <button onClick={()=>openTextFile((text)=>{ if (!onRestore(text.trim())) showToast("That file isn't a Weekly Budget backup", null); })} style={{ ...rowBtn, color:C.text, marginBottom:10 }}>
+              <RotateCcw size={18} color={C.accent2} /> Restore from file
+            </button>
+            <button onClick={()=>{ saveTextFile("weekly-budget-purchases-"+toDateInput(Date.now())+".csv", "text/csv", purchasesCsv(store)); showToast("Purchases exported", null); }} style={{ ...rowBtn, color:C.text, marginBottom:10 }}>
+              <Receipt size={18} color={C.accent2} /> Export purchases<span style={{ marginLeft:"auto", color:C.muted, fontSize:12.5, fontWeight:500 }}>CSV for spreadsheets</span>
+            </button>
+            <button onClick={()=>setBackupOpen(true)} style={{ ...rowBtn, color:C.text, marginBottom:10 }}><Pencil size={18} color={C.accent2} /> Copy or paste backup text</button>
             {!confirmReset ? (
               <button onClick={()=>setConfirmReset(true)} style={{ ...rowBtn, color:C.red }}><Trash2 size={18} /> Reset all data</button>
             ) : (
               <div style={{ background:"rgba(248,113,113,0.08)", border:"1px solid rgba(248,113,113,0.3)", borderRadius:12, padding:14 }}>
-                <div style={{ fontSize:13.5, color:C.text, marginBottom:12, textAlign:"center" }}>Delete <strong>all periods and purchases</strong>? This cannot be undone.</div>
+                <div style={{ fontSize:13.5, color:C.text, marginBottom:12, textAlign:"center", lineHeight:1.45 }}>
+                  {user
+                    ? <React.Fragment>Delete <strong>all periods and purchases</strong> here <strong>and in your synced account</strong> — the Android app and your other devices too? You'll get a few seconds to undo.</React.Fragment>
+                    : <React.Fragment>Delete <strong>all periods and purchases</strong>? You'll get a few seconds to undo.</React.Fragment>}
+                </div>
                 <div style={{ display:"flex", gap:10 }}>
                   <button onClick={()=>setConfirmReset(false)} style={{ flex:1, padding:"11px 0", borderRadius:11, border:`1px solid ${C.border}`, background:"transparent", color:C.sub, fontSize:14, fontWeight:600, cursor:"pointer" }}>Cancel</button>
                   <button onClick={onReset} style={{ flex:1, padding:"11px 0", borderRadius:11, border:"none", background:C.red, color:"#2a0a0a", fontSize:14, fontWeight:700, cursor:"pointer" }}>Reset</button>
@@ -1290,7 +2017,8 @@
             <div style={{ ...sectionLabel, marginTop:22 }}>ABOUT</div>
             <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:12, padding:16, textAlign:"center" }}>
               <div style={{ fontSize:14.5, fontWeight:700, color:C.text }}>Weekly Budget — Web</div>
-              <div style={{ fontSize:12.5, color:C.sub, marginTop:3 }}>Version 3.2 · Gas reimbursements</div>
+              <div style={{ fontSize:12.5, color:C.sub, marginTop:3 }}>Version 3.5 · Spending categories, quick add &amp; live rates</div>
+              <div style={{ fontSize:11.5, color:C.muted, marginTop:6 }}>{user ? "Your data is synced to your Google account." : "Your data is stored only in this browser."} Press <strong>N</strong> anywhere to add a purchase.</div>
             </div>
             {backupOpen && <BackupModal store={store} onRestore={onRestore} onClose={()=>setBackupOpen(false)} />}
           </div>
@@ -1358,11 +2086,44 @@
       );
     }
 
+    /* ================= Onboarding ================= */
+    function Onboarding({ onDone }) {
+      const [step, setStep] = useState(0);
+      const slides = [
+        { icon:<Wallet size={30} color="#06281d" />, iconBg:`linear-gradient(135deg, ${C.greenDim}, ${C.green})`,
+          title:"Welcome to Weekly Budget", body:"A simple way to plan each pay period and see exactly how much you have left to spend." },
+        { icon:<Sliders size={28} color={C.accent} />, iconBg:"rgba(129,140,248,0.15)",
+          title:"1 · Set up your budget", body:"On the Budget tab, enter your income, savings, gas, insurance, and the amount you want left over. Your spending limit is calculated automatically." },
+        { icon:<Receipt size={28} color={C.accent} />, iconBg:"rgba(129,140,248,0.15)",
+          title:"2 · Log your spending", body:"Click Add purchase (or press N) to log each purchase as you go. Split your limit into categories like Food or Fun to see each one fill up." },
+        { icon:<Target size={28} color={C.amber} />, iconBg:"rgba(251,191,36,0.15)",
+          title:"3 · Stay on track", body:"The Dashboard shows what's left and whether you'll hit your end goal. Open the period picker in the sidebar anytime to start a new pay period." },
+      ];
+      const last = step === slides.length - 1;
+      const s = slides[step];
+      return (
+        <div style={{ position:"fixed", inset:0, background:"rgba(6,7,10,0.88)", backdropFilter:"blur(6px)", zIndex:100, display:"flex", alignItems:"center", justifyContent:"center", padding:20, animation:"fadeIn 0.25s ease" }}>
+          <div style={{ width:"100%", maxWidth:420, background:C.bg2, border:`1px solid ${C.border}`, borderRadius:20, padding:"32px 28px 24px", display:"flex", flexDirection:"column", alignItems:"center", textAlign:"center", animation:"popIn 0.2s ease" }}>
+            <div style={{ width:66, height:66, borderRadius:19, background:s.iconBg, display:"flex", alignItems:"center", justifyContent:"center", marginBottom:20, transition:"background 0.3s ease" }}>{s.icon}</div>
+            <div style={{ fontSize:21, fontWeight:800, color:C.text, marginBottom:10, letterSpacing:-0.3 }}>{s.title}</div>
+            <div style={{ fontSize:14.5, color:C.sub, lineHeight:1.5, marginBottom:22, minHeight:66 }}>{s.body}</div>
+            <div style={{ display:"flex", gap:7, marginBottom:22 }}>
+              {slides.map((_, i)=><div key={i} style={{ width: i===step?22:7, height:7, borderRadius:99, background: i===step?C.green:C.border, transition:"all 0.3s ease" }} />)}
+            </div>
+            <button onClick={()=>(last ? onDone() : setStep(step+1))} style={{ width:"100%", padding:"14px 0", borderRadius:12, border:"none", background:`linear-gradient(90deg, ${C.greenDim}, ${C.green})`, color:"#06281d", fontSize:15.5, fontWeight:700, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:7 }}>
+              {last ? <React.Fragment><Check size={18} /> Get started</React.Fragment> : "Next"}
+            </button>
+            {!last && <button onClick={onDone} style={{ marginTop:12, background:"transparent", border:"none", color:C.muted, fontSize:13, fontWeight:600, cursor:"pointer" }}>Skip</button>}
+          </div>
+        </div>
+      );
+    }
+
     /* ================= Cloud sync (Firebase) =================
-       Strategy: each user's whole budget lives at budgets/{uid} as { data, updatedAt }.
-       On sign-in we merge by timestamp (newer wins), then keep a live onSnapshot
-       subscription. Local edits debounce-write up. lastSyncedRef suppresses echoes
-       so a remote update we just applied doesn't bounce straight back to the cloud. */
+       Each user's whole budget lives at budgets/{uid} as { data, travel, updatedAt } — the same doc
+       the Android app uses. Writes go through a transaction: if another device wrote since this one
+       last synced, the two versions are merged (periods and purchases added or deleted on either side
+       are kept; settings come from the newer side) instead of one overwriting the other. */
     function useCloudSync({ store, setStore, travel, setTravel, showToast }) {
       const [user, setUser] = useState(null);
       const [syncState, setSyncState] = useState("Local only");
@@ -1376,12 +2137,32 @@
       const sig = (s, t) => JSON.stringify({ d: s, t: normTravel(t) });
       const lastSyncedRef = useRef(sig(store, travel)); // content last loaded/synced — baseline for edit detection
       const localUpdatedRef = useRef((() => { try { return parseInt(localStorage.getItem(UPDATED_KEY) || "0", 10); } catch (e) { return 0; } })());
+      // The cloud version this browser last matched: { uid, at: its updatedAt, base: syncBase(it) }.
+      // A local edit newer than `at` hasn't reached the cloud; a cloud updatedAt other than `at`
+      // means another device wrote since. When both are true the two are merged, not replaced.
+      const syncMetaRef = useRef((() => { try { return JSON.parse(localStorage.getItem(SYNC_KEY)) || null; } catch (e) { return null; } })());
       const writeTimer = useRef(null);
+      const pushingRef = useRef(false);
+      const pushAgainRef = useRef(false);
       const readyRef = useRef(false);
       const storeRef = useRef(store);
       storeRef.current = store;
       const travelRef = useRef(travel);
       travelRef.current = travel;
+      const userRef = useRef(user);
+      userRef.current = user;
+
+      const setLocalUpdated = (ts) => {
+        localUpdatedRef.current = ts;
+        try { localStorage.setItem(UPDATED_KEY, String(ts)); } catch (e) {}
+      };
+      const markSynced = (data, at) => {
+        syncMetaRef.current = { uid: userRef.current && userRef.current.uid, at, base: syncBase(data) };
+        try { localStorage.setItem(SYNC_KEY, JSON.stringify(syncMetaRef.current)); } catch (e) {}
+      };
+      // The sync point for this account — null if we last synced with a different one (or never).
+      const syncedFor = (uid) => { const m = syncMetaRef.current; return m && m.uid === uid ? m : null; };
+      const hasUnsynced = () => { const m = syncedFor(userRef.current && userRef.current.uid); return localUpdatedRef.current > (m ? m.at : 0); };
 
       // Apply data coming FROM the cloud without it counting as a local edit: set the
       // baseline + edit-time to match the incoming data before storing it, so the
@@ -1391,10 +2172,79 @@
         const hasTravel = travelField != null;                 // legacy docs may omit travel — keep local then
         const t = hasTravel ? normTravel(travelField) : travelRef.current;
         lastSyncedRef.current = sig(n, t);
-        localUpdatedRef.current = updatedAt || Date.now();
-        try { localStorage.setItem(UPDATED_KEY, String(localUpdatedRef.current)); } catch (e) {}
+        setLocalUpdated(updatedAt || Date.now());
         setStore(n);
         if (hasTravel) setTravel(t);
+      };
+
+      const schedulePush = (delay) => {
+        if (writeTimer.current) clearTimeout(writeTimer.current);
+        writeTimer.current = setTimeout(push, delay);
+      };
+
+      // Write local data up inside a transaction, so a cloud version written since our last sync
+      // (by another device, while this one was offline) is merged in rather than overwritten.
+      const push = () => {
+        const fb = fbRef.current, u = userRef.current;
+        if (!fb || !u) return;
+        if (pushingRef.current) { pushAgainRef.current = true; return; }
+        pushingRef.current = true;
+        setSyncState("Saving…");
+        const ref = fb.doc(fb.db, "budgets", u.uid);
+        const local = storeRef.current, localTravel = normTravel(travelRef.current);
+        const startSig = sig(local, localTravel);
+        const localAt = localUpdatedRef.current;
+        const meta = syncedFor(u.uid);
+        const legacy = !syncMetaRef.current; // last synced before merging existed — no base recorded
+        fb.runTransaction(fb.db, async (t) => {
+          const snap = await t.get(ref);
+          const cloud = snap.exists() ? snap.data() : null;
+          const cloudAt = (cloud && cloud.updatedAt) || 0;
+          const cloudData = cloud && cloud.data ? normalize(cloud.data) : null;
+          const ts = Math.max(Date.now(), cloudAt + 1);
+          if (cloudData && (!meta || cloudAt !== meta.at)) {
+            const cloudTravel = cloud.travel != null ? normTravel(cloud.travel) : localTravel;
+            if (sig(cloudData, cloudTravel) === startSig) return { data: cloudData, travel: cloudTravel, at: cloudAt, merged: false };
+            const cloudWins = cloudAt > localAt;
+            // Data last synced with a different account: don't mix two people's budgets — newest wins.
+            const data = meta || legacy
+              ? mergeStores(cloudWins ? cloudData : local, cloudWins ? local : cloudData, meta ? meta.base : null)
+              : (cloudWins ? cloudData : local);
+            const travelOut = cloudWins ? cloudTravel : localTravel;
+            t.set(ref, { data, travel: travelOut, updatedAt: ts });
+            return { data, travel: travelOut, at: ts, merged: true };
+          }
+          if (cloudData && localAt <= meta.at) return { data: local, travel: localTravel, at: cloudAt, merged: false }; // nothing new on either side
+          t.set(ref, { data: local, travel: localTravel, updatedAt: ts });
+          return { data: local, travel: localTravel, at: ts, merged: false };
+        }).then((r) => {
+          // Edited while the write was in flight: keep the old sync point so the next push merges again.
+          if (sig(storeRef.current, travelRef.current) !== startSig) { pushAgainRef.current = true; return; }
+          if (r.merged) applyRemote(r.data, r.travel, r.at);
+          markSynced(r.data, r.at);
+          setSyncState("Synced");
+        }).catch(() => setSyncState(navigator.onLine === false ? "Offline · will sync" : "Sync error"))
+          .finally(() => {
+            pushingRef.current = false;
+            if (pushAgainRef.current) { pushAgainRef.current = false; schedulePush(300); }
+          });
+      };
+
+      // A cloud version arrived — on sign-in / reconnect, or another device wrote.
+      const reconcile = (cloud) => {
+        const u = userRef.current; if (!u) return;
+        if (!cloud || !cloud.data) { schedulePush(0); return; }   // nothing in the cloud yet → seed it
+        const meta = syncedFor(u.uid);
+        const cloudAt = cloud.updatedAt || 0;
+        if (meta && cloudAt === meta.at) {                        // our own write, or unchanged
+          if (hasUnsynced()) schedulePush(0); else setSyncState("Synced");
+          return;
+        }
+        const n = normalize(cloud.data);
+        const cloudTravel = cloud.travel != null ? normTravel(cloud.travel) : travelRef.current;
+        if (n && sig(n, cloudTravel) === sig(storeRef.current, travelRef.current)) { markSynced(n, cloudAt); setSyncState("Synced"); return; }
+        if (meta && !hasUnsynced()) { applyRemote(cloud.data, cloud.travel, cloudAt); markSynced(n, cloudAt); setSyncState("Synced"); return; }
+        schedulePush(0);                                          // changed on both sides → push() merges
       };
 
       // bridge to window.__fb (set by the module loader); watch auth
@@ -1417,44 +2267,30 @@
         return () => { window.removeEventListener("firebase-ready", onReady); if (unsubAuth) unsubAuth(); };
       }, []);
 
-      // On sign-in: newest-wins merge (compare true edit-times), then live subscription.
+      // On sign-in: follow the cloud doc live. Only server snapshots count — an offline cache
+      // snapshot can look like "nothing in the cloud". The first one reconciles with local data.
       useEffect(() => {
         const fb = fbRef.current;
         readyRef.current = false;
         if (unsubDocRef.current) { unsubDocRef.current(); unsubDocRef.current = null; }
         if (!fb || !user) return;
+        setSyncState(navigator.onLine === false ? "Offline · will sync" : "Syncing…");
         const ref = fb.doc(fb.db, "budgets", user.uid);
-        setSyncState("Syncing…");
-        let cancelled = false;
-        fb.getDoc(ref).then((snap) => {
-          if (cancelled) return;
-          const local = storeRef.current;
-          const localUpdated = localUpdatedRef.current;
-          if (snap.exists() && snap.data() && snap.data().data) {
-            const cloud = snap.data();
-            if ((cloud.updatedAt || 0) > localUpdated) {
-              applyRemote(cloud.data, cloud.travel, cloud.updatedAt);   // cloud edited more recently → take it
-            } else {
-              lastSyncedRef.current = sig(local, travelRef.current);    // local edited more recently → keep + push
-              fb.setDoc(ref, { data: local, travel: normTravel(travelRef.current), updatedAt: localUpdated || Date.now() }, { merge: true });
-            }
-          } else {
-            lastSyncedRef.current = sig(local, travelRef.current);      // nothing in cloud yet → seed it
-            fb.setDoc(ref, { data: local, travel: normTravel(travelRef.current), updatedAt: localUpdated || Date.now() });
-          }
+        unsubDocRef.current = fb.onSnapshot(ref, (s) => {
+          if (s.metadata.fromCache || s.metadata.hasPendingWrites) return;
           readyRef.current = true;
-          setSyncState("Synced");
-          unsubDocRef.current = fb.onSnapshot(ref, (s) => {
-            if (s.metadata.hasPendingWrites) return;              // ignore our own in-flight write
-            const d = s.data(); if (!d || !d.data) return;
-            const remoteTravel = d.travel != null ? d.travel : travelRef.current;
-            if (sig(normalize(d.data), remoteTravel) === lastSyncedRef.current) return; // nothing new
-            applyRemote(d.data, d.travel, d.updatedAt);           // a change from another device
-            setSyncState("Synced");
-          }, () => setSyncState("Sync error"));
-        }).catch(() => setSyncState("Sync error"));
-        return () => { cancelled = true; if (unsubDocRef.current) { unsubDocRef.current(); unsubDocRef.current = null; } };
+          reconcile(s.exists() ? s.data() : null);
+        }, () => setSyncState("Sync error"));
+        return () => { if (unsubDocRef.current) { unsubDocRef.current(); unsubDocRef.current = null; } };
       }, [user]);
+
+      // Retry a failed (offline) push when the connection or the tab comes back.
+      useEffect(() => {
+        const retry = () => { if (readyRef.current && userRef.current && hasUnsynced()) schedulePush(0); };
+        const onVis = () => { if (document.visibilityState === "visible") retry(); };
+        window.addEventListener("online", retry); document.addEventListener("visibilitychange", onVis);
+        return () => { window.removeEventListener("online", retry); document.removeEventListener("visibilitychange", onVis); };
+      }, []);
 
       // Detect a genuine local edit (store diverges from the synced baseline), stamp the
       // real edit time, and push up when signed in. Loads and applied remote updates match
@@ -1463,18 +2299,9 @@
         const json = sig(store, travel);
         if (json === lastSyncedRef.current) return;   // load / remote echo — not a local edit
         lastSyncedRef.current = json;
-        localUpdatedRef.current = Date.now();
-        try { localStorage.setItem(UPDATED_KEY, String(localUpdatedRef.current)); } catch (e) {}
-        const fb = fbRef.current;
-        if (!fb || !user || !readyRef.current) return; // edit while signed out — stamped locally, pushed on next sign-in
-        if (writeTimer.current) clearTimeout(writeTimer.current);
-        setSyncState("Saving…");
-        const ts = localUpdatedRef.current;
-        writeTimer.current = setTimeout(() => {
-          fb.setDoc(fb.doc(fb.db, "budgets", user.uid), { data: store, travel: normTravel(travel), updatedAt: ts }, { merge: true })
-            .then(() => setSyncState("Synced")).catch(() => setSyncState("Sync error"));
-        }, 700);
-        return () => { if (writeTimer.current) clearTimeout(writeTimer.current); };
+        setLocalUpdated(Date.now());
+        if (!fbRef.current || !user || !readyRef.current) return; // stamped locally; pushed once the cloud is reachable
+        schedulePush(700);
       }, [store, travel, user]);
 
       const signIn = () => {
@@ -1498,6 +2325,11 @@
       const [tab, setTab] = useState("dashboard");
       const [periodsOpen, setPeriodsOpen] = useState(false);
       const [settingsOpen, setSettingsOpen] = useState(false);
+      const [showOnboarding, setShowOnboarding] = useState(()=>{
+        // Existing users (data already saved here) skip the intro.
+        try { return !localStorage.getItem(ONBOARD_KEY) && !localStorage.getItem(STORAGE_KEY); } catch(e){ return false; }
+      });
+      const finishOnboarding = () => { try { localStorage.setItem(ONBOARD_KEY, "1"); } catch(e){} setShowOnboarding(false); };
       const [themeMode, setThemeMode] = useState(()=>{ try { return localStorage.getItem(THEME_KEY)||"dark"; } catch(e){ return "dark"; } });
       const [accent, setAccent] = useState(()=>{ try { return JSON.parse(localStorage.getItem(ACCENT_KEY))||{ key:"green", custom:"#34d399" }; } catch(e){ return { key:"green", custom:"#34d399" }; } });
       const [travel, setTravel] = useState(()=>{ try { return JSON.parse(localStorage.getItem(TRAVEL_KEY))||{ enabled:false, code:"JPY", symbol:"¥", rate:150 }; } catch(e){ return { enabled:false, code:"JPY", symbol:"¥", rate:150 }; } });
@@ -1505,12 +2337,36 @@
       const toastTimer = useRef(null);
       applyTheme(themeMode, resolveAccent(accent.key, accent.custom));
 
+      const showToast = (message, undo, note) => { setToast({ message, undo, note }); if (toastTimer.current) clearTimeout(toastTimer.current); toastTimer.current = setTimeout(()=>setToast(null), 4500); };
+
+      // Travel mode: fetch today's rate when it's missing, from an earlier day, or for another currency.
+      // A rate typed in today wins until tomorrow.
+      const refreshRate = async (manual) => {
+        const code = travel.code;
+        const r = await fetchUsdRate(code);
+        if (!r) { if (manual) showToast("Couldn't get today's rate — check your connection", null); return; }
+        setTravel((t)=>(t.code===code ? { ...t, rate:r.rate, rateUpdated:Date.now(), rateSource:"live", rateCode:code, rateDate:r.date } : t));
+        if (manual) showToast(`1 USD = ${travel.symbol}${r.rate.toLocaleString()} (${r.date})`, null);
+      };
+      const rateFresh = travel.rateCode === travel.code && travel.rateUpdated && isToday(travel.rateUpdated);
+      const legacyRate = !travel.rateCode && travel.rateUpdated && isToday(travel.rateUpdated); // set today before rates were fetched
+      useEffect(()=>{
+        if (!travel.enabled || rateFresh || legacyRate) return;
+        refreshRate(false);
+        const retry = () => refreshRate(false);
+        window.addEventListener("online", retry);
+        return () => window.removeEventListener("online", retry);
+      }, [travel.enabled, travel.code, rateFresh]);
+
       // Convert tab only exists while travel mode is on — bounce off it if travel gets disabled.
       useEffect(()=>{ if (tab==="convert" && !(travel && travel.enabled)) setTab("dashboard"); }, [tab, travel && travel.enabled]);
 
-      const showToast = (message, undo) => { setToast({ message, undo }); if (toastTimer.current) clearTimeout(toastTimer.current); toastTimer.current = setTimeout(()=>setToast(null), 4500); };
-
       const { user, syncState, signIn, signOut } = useCloudSync({ store, setStore, travel, setTravel, showToast });
+
+      // New periods start from what was left of the last one (on by default; remembered per browser).
+      const [carryOver, setCarryOver] = useState(()=>{ try { return localStorage.getItem(CARRY_KEY) !== "0"; } catch(e){ return true; } });
+      useEffect(()=>{ try { localStorage.setItem(CARRY_KEY, carryOver ? "1" : "0"); } catch(e){} }, [carryOver]);
+      const [quickAdd, setQuickAdd] = useState(null); // { pid, day } while the quick-add dialog is open
 
       useEffect(()=>{ try { localStorage.setItem(THEME_KEY, themeMode); } catch(e){} const m=document.querySelector('meta[name="theme-color"]'); if(m) m.setAttribute("content", C.bg); }, [themeMode]);
       useEffect(()=>{ try { localStorage.setItem(ACCENT_KEY, JSON.stringify(accent)); } catch(e){} }, [accent]);
@@ -1539,40 +2395,113 @@
       const readOnly = !!view.readOnly;
       const computed = useMemo(()=>computeStats(view), [view]);
 
+      const updatePeriod = (pid, updater) => setStore((s)=>({ ...s, periods:s.periods.map((p)=>(p.id===pid?updater(p):p)) }));
       const updateActive = (updater) => setStore((s)=>({ ...s, periods:s.periods.map((p)=>(p.id===s.activePeriodId?updater(p):p)) }));
       const update = (patch) => updateActive((p)=>({ ...p, ...patch }));
-      const addTransaction = (t) => updateActive((p)=>({ ...p, transactions:[...p.transactions, t] }));
-      const removeTransaction = (id) => {
-        const p = activePeriod; const idx = p.transactions.findIndex((x)=>x.id===id); if (idx<0) return;
-        const removed = p.transactions[idx];
-        updateActive((pp)=>({ ...pp, transactions:pp.transactions.filter((x)=>x.id!==id) }));
-        showToast(isRefundCat(removed.category)?"Reimbursement deleted":"Purchase deleted", ()=>{ updateActive((pp)=>{ const arr=pp.transactions.slice(); arr.splice(Math.min(idx,arr.length),0,removed); return { ...pp, transactions:arr }; }); setToast(null); });
+      // Purchase edits take a period id so the Calendar and all-period search can edit any period.
+      const addTransaction = (t, pid = store.activePeriodId) => {
+        // If this purchase takes its category (further) over, say how much spilled into Other.
+        const before = store.periods.find((p)=>p.id===pid);
+        let spillNote = "";
+        if (before && t.allocId && t.category === "spending") {
+          const was = computeStats(before).catOver[t.allocId] || 0;
+          const now = computeStats({ ...before, transactions:[...before.transactions, t] }).catOver[t.allocId] || 0;
+          const cat = (before.spendingAllocations||[]).find((a)=>a.id===t.allocId);
+          if (now > was) spillNote = `${fmt(now - was)} over ${(cat && cat.name) || "category"} — taken from Other`;
+        }
+        updatePeriod(pid, (p)=>({ ...p, transactions:[...p.transactions, t] }));
+        showToast((isRefundCat(t.category) ? "Refund " : "Added ") + fmt(t.amount) + " · " + t.merchant, ()=>{
+          updatePeriod(pid, (p)=>({ ...p, transactions:p.transactions.filter((x)=>x.id!==t.id) }));
+          setToast(null);
+        }, spillNote);
       };
-      const updateTransaction = (id, patch) => updateActive((p)=>({ ...p, transactions:p.transactions.map((x)=>(x.id===id?{ ...x, ...patch }:x)) }));
+      const removeTransaction = (id, pid = store.activePeriodId) => {
+        const p = store.periods.find((x)=>x.id===pid);
+        const idx = p ? (p.transactions||[]).findIndex((x)=>x.id===id) : -1;
+        if (idx < 0) return;
+        const removed = p.transactions[idx];
+        updatePeriod(pid, (pp)=>({ ...pp, transactions:pp.transactions.filter((x)=>x.id!==id) }));
+        showToast(isRefundCat(removed.category) ? "Refund deleted" : "Purchase deleted", ()=>{
+          updatePeriod(pid, (pp)=>({ ...pp, transactions:reinsert(pp.transactions, idx, removed) }));
+          setToast(null);
+        });
+      };
+      const updateTransaction = (id, patch, pid = store.activePeriodId) => updatePeriod(pid, (p)=>({ ...p, transactions:p.transactions.map((x)=>(x.id===id?{ ...x, ...patch }:x)) }));
       const clearTransactions = () => updateActive((p)=>({ ...p, transactions:[] }));
+      // Removing a list item (allocation, category, recurring expense) offers Undo. Blank rows just go.
+      const removeWithUndo = (list, id, apply, label, extra) => {
+        const idx = (list||[]).findIndex((x)=>x.id===id);
+        if (idx < 0) return;
+        const item = list[idx];
+        apply((l)=>(l||[]).filter((x)=>x.id!==id));
+        const name = (item.name || item.merchant || "").trim();
+        if (!name && !item.amount) return;
+        showToast((name ? `"${name}"` : label) + " removed" + (extra || ""), ()=>{ apply((l)=>reinsert(l, idx, item)); setToast(null); });
+      };
       // Recurring expenses — store-level templates auto-logged into each new pay period.
-      const addRecurring = () => setStore((s)=>({ ...s, recurring:[...(s.recurring||[]), { id:"r"+uid(), merchant:"", amount:0 }] }));
+      const addRecurring = () => setStore((s)=>({ ...s, recurring:[...(s.recurring||[]), { id:"r"+uid(), merchant:"", amount:0, category:"spending", freq:"period", day:1 }] }));
       const updateRecurring = (id, patch) => setStore((s)=>({ ...s, recurring:(s.recurring||[]).map((r)=>(r.id===id?{ ...r, ...patch }:r)) }));
-      const removeRecurring = (id) => setStore((s)=>({ ...s, recurring:(s.recurring||[]).filter((r)=>r.id!==id) }));
+      const removeRecurring = (id) => removeWithUndo(store.recurring, id, (fn)=>setStore((s)=>({ ...s, recurring:fn(s.recurring) })), "Recurring expense");
       const applyRecurring = () => { // add any missing recurring expenses to the CURRENT period
         const rec = (store.recurring||[]).filter((r)=>r.amount>0);
         if (!rec.length || !activePeriod || activePeriod.type!=="single") return;
-        const have = new Set((activePeriod.transactions||[]).map((t)=>t.recurringId).filter(Boolean));
-        const toAdd = rec.filter((r)=>!have.has(r.id));
+        const have = new Set((activePeriod.transactions||[]).map((t)=>t.recurringKey||t.recurringId).filter(Boolean));
+        const toAdd = [].concat(...rec.map((r)=>recurringTxFor(activePeriod, r))).filter((t)=>!have.has(t.recurringKey));
         if (!toAdd.length) { showToast("All recurring expenses are already in this period", null); return; }
-        updateActive((p)=>({ ...p, transactions:[...p.transactions, ...toAdd.map((r)=>({ id:uid(), recurringId:r.id, amount:r.amount, merchant:r.merchant.trim()||"Recurring", category:"spending", date:Date.now() }))] }));
+        updateActive((p)=>({ ...p, transactions:[...p.transactions, ...toAdd] }));
         showToast(toAdd.length+" recurring expense"+(toAdd.length>1?"s":"")+" added", null);
       };
       const addAllocation = (name) => updateActive((p)=>({ ...p, allocations:[...(p.allocations||[]), { id:"a"+Date.now()+Math.random().toString(36).slice(2,5), name:name||"", amount:0 }] }));
       const updateAllocation = (id, patch) => updateActive((p)=>({ ...p, allocations:(p.allocations||[]).map((a)=>(a.id===id?{ ...a, ...patch }:a)) }));
-      const removeAllocation = (id) => updateActive((p)=>({ ...p, allocations:(p.allocations||[]).filter((a)=>a.id!==id) }));
-      const resetAllData = () => { setStore(DEFAULT_DATA); setSettingsOpen(false); setTab("dashboard"); showToast("All data reset", null); };
-      const restoreData = (json) => { try { const n=normalize(JSON.parse(json)); if(!n) return false; setStore(n); setSettingsOpen(false); setTab("dashboard"); showToast("Backup restored", null); return true; } catch(e){ return false; } };
-      const createPeriod = () => {
-        const src = view;
-        const np = makePeriod({ period:"New Pay Period", startDate:periodEnd(src), lengthDays:src.lengthDays||14, startingBalance:src.startingBalance, totalIncome:src.totalIncome, savings:src.savings, gasBudget:src.gasBudget, insurance:src.insurance, endGoal:src.endGoal, allocations:(src.allocations||[]).map((a,i)=>({ id:"a"+Date.now()+i+Math.random().toString(36).slice(2,4), name:a.name, amount:a.amount })) });
-        const rec = (store.recurring||[]).filter((r)=>r.amount>0);
-        if (rec.length) np.transactions = rec.map((r)=>({ id:uid(), recurringId:r.id, amount:r.amount, merchant:r.merchant.trim()||"Recurring", category:"spending", date:np.startDate }));
+      const removeAllocation = (id) => {
+        const pid = activePeriod.id;
+        removeWithUndo(activePeriod.allocations, id, (fn)=>updatePeriod(pid, (p)=>({ ...p, allocations:fn(p.allocations) })), "Allocation");
+      };
+      const addSpendAlloc = (name) => updateActive((p)=>({ ...p, spendingAllocations:[...(p.spendingAllocations||[]), { id:"s"+uid(), name:name||"", amount:0, color:nextSpendColor(p.spendingAllocations) }] }));
+      const updateSpendAlloc = (id, patch) => updateActive((p)=>({ ...p, spendingAllocations:(p.spendingAllocations||[]).map((a)=>(a.id===id?{ ...a, ...patch }:a)) }));
+      // Tagged purchases keep their category id, so Undo puts them straight back in the category.
+      const removeSpendAlloc = (id) => {
+        const pid = activePeriod.id;
+        const n = (activePeriod.transactions||[]).filter((t)=>t.allocId===id).length;
+        removeWithUndo(activePeriod.spendingAllocations, id, (fn)=>updatePeriod(pid, (p)=>({ ...p, spendingAllocations:fn(p.spendingAllocations) })), "Category",
+          n ? ` · ${n} purchase${n>1?"s":""} moved to Other` : "");
+      };
+      // Both replace everything (and sync that everywhere when signed in), so keep the old data for Undo.
+      const replaceAllData = (next, message) => {
+        const prev = store;
+        setStore(next); setSettingsOpen(false); setTab("dashboard");
+        showToast(message, ()=>{ setStore(prev); setToast(null); });
+      };
+      const resetAllData = () => replaceAllData(defaultData(), "All data reset");
+      const restoreData = (json) => { try { const n=normalize(JSON.parse(json)); if(!n) return false; replaceAllData(n, "Backup restored"); return true; } catch(e){ return false; } };
+
+      // The pay period a new one builds on: the active one, or a monthly view's latest period
+      // (a monthly view's totals are the SUM of its periods — copying them would double everything).
+      const nextSource = () => {
+        if (activePeriod.type === "single") return activePeriod;
+        const singles = store.periods.filter((p)=>p.type==="single");
+        const sources = singles.filter((p)=>(activePeriod.sourceIds||[]).includes(p.id));
+        return (sources.length ? sources : singles).slice().sort((a,b)=>b.startDate-a.startDate)[0] || view;
+      };
+      const carryAmount = Math.max(0, Math.round(computeStats(nextSource()).projectedLeftover * 100) / 100);
+      // The active period is over and nothing comes after it yet → offer to start the next one.
+      const periodEnded = activePeriod.type === "single" && startOfDay(Date.now()) >= periodEnd(activePeriod)
+        && !store.periods.some((p)=>p.type==="single" && startOfDay(p.startDate) >= startOfDay(periodEnd(activePeriod)));
+
+      const createPeriod = (carry = carryOver) => {
+        const src = nextSource();
+        const leftover = carryAmount;
+        const startDate = periodEnd(src);
+        const np = makePeriod({
+          period:"New Pay Period",
+          startDate, lengthDays: src.monthly ? monthLength(startDate) : (src.lengthDays||14), monthly: !!src.monthly,
+          startingBalance: carry && leftover > 0 ? leftover : src.startingBalance, totalIncome:src.totalIncome,
+          savings:src.savings, gasBudget:src.gasBudget, insurance:src.insurance, endGoal:src.endGoal,
+          allocations:(src.allocations||[]).map((a,i)=>({ id:"a"+Date.now()+i+Math.random().toString(36).slice(2,4), name:a.name, amount:a.amount })),
+          spendingAllocations:(src.spendingAllocations||[]).map((a)=>({ id:"s"+uid(), name:a.name, amount:a.amount, color:a.color })),
+        });
+        const rec = [].concat(...(store.recurring||[]).filter((r)=>r.amount>0).map((r)=>recurringTxFor(np, r)));
+        if (rec.length) np.transactions = rec;
         setStore((s)=>({ ...s, periods:[np, ...s.periods], activePeriodId:np.id })); setPeriodsOpen(false); setTab("budget");
         if (rec.length) showToast(rec.length+" recurring expense"+(rec.length>1?"s":"")+" added to the new period", null);
       };
@@ -1588,6 +2517,7 @@
       const archivePeriod = (id) => setStore((s)=>{
         const p = s.periods.find((x)=>x.id===id);
         if (!p || p.type!=="single") return s;
+        // Keep at least one editable (single) period around.
         const otherSingles = s.periods.filter((x)=>x.type==="single" && x.id!==id);
         if (!otherSingles.length) return s;
         const archived = makeArchivedPeriod(p);
@@ -1596,6 +2526,45 @@
         if (activePeriodId===id) activePeriodId = otherSingles[0].id;
         return { ...s, periods, activePeriodId };
       });
+
+      // Quick add logs into the period on screen; from the Calendar (or when a monthly view is on
+      // screen) it picks the pay period that contains the day.
+      const singles = store.periods.filter((p)=>p.type==="single");
+      const periodFor = (day) => singles.find((p)=>day >= startOfDay(p.startDate) && day < periodEnd(p));
+      const openQuickAdd = (day) => {
+        const target = day != null
+          ? periodFor(startOfDay(day)) || (activePeriod.type==="single" ? activePeriod : null)
+          : (activePeriod.type==="single" ? activePeriod : periodFor(startOfDay(Date.now())) || singles[0]);
+        if (!target) return;
+        setPeriodsOpen(false); setSettingsOpen(false);
+        setQuickAdd({ pid:target.id, day: day != null ? startOfDay(day) : null });
+      };
+      const quickPeriod = quickAdd && store.periods.find((p)=>p.id===quickAdd.pid);
+      // "N" opens quick add from anywhere (not while typing or with a dialog open).
+      const hotkeyRef = useRef(null);
+      hotkeyRef.current = (e) => {
+        if (e.key !== "n" && e.key !== "N") return;
+        if (e.metaKey || e.ctrlKey || e.altKey || e.repeat) return;
+        const el = document.activeElement, tag = el && el.tagName;
+        if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (el && el.isContentEditable)) return;
+        if (quickAdd || periodsOpen || settingsOpen || showOnboarding || !singles.length) return;
+        e.preventDefault(); openQuickAdd();
+      };
+      useEffect(()=>{
+        const onKey = (e) => hotkeyRef.current(e);
+        window.addEventListener("keydown", onKey);
+        return () => window.removeEventListener("keydown", onKey);
+      }, []);
+      const editCategories = () => {
+        setTab("budget");
+        setTimeout(()=>{
+          const el = document.getElementById("spend-categories"); if (!el) return;
+          // On narrow screens the sidebar becomes a sticky top header — scroll below it.
+          const sb = document.querySelector(".sidebar");
+          const header = sb && getComputedStyle(sb).flexDirection === "row" ? sb.offsetHeight : 0;
+          window.scrollTo({ top: el.getBoundingClientRect().top + window.scrollY - header - 16 }); // instant — a smooth scroll gets cancelled by the tab's entry animation
+        }, 80);
+      };
 
       const titleMap = { dashboard:"Dashboard", spending:"Spending", convert:"Converter", calendar:"Calendar", budget:"Budget" };
       const travelOn = travel.enabled && travel.rate>0;
@@ -1615,20 +2584,23 @@
                   </div>
                 </div>
                 {travelOn && <div style={{ display:"flex", alignItems:"center", gap:8, background:"rgba(251,191,36,0.08)", border:"1px solid rgba(251,191,36,0.28)", borderRadius:10, padding:"8px 12px", fontSize:12.5, fontWeight:600, color:C.amber }}><Plane size={15} /> {travel.code} · 1 USD = {travel.symbol}{travel.rate}</div>}
-                {tab!=="calendar" && tab!=="convert" && !readOnly && <button onClick={()=>setTab("spending")} style={{ display:"flex", alignItems:"center", gap:7, padding:"10px 16px", borderRadius:11, border:"none", background:`linear-gradient(90deg, ${C.greenDim}, ${C.green})`, color:"#06281d", fontSize:14, fontWeight:700, cursor:"pointer" }}><Plus size={17} /> Add purchase</button>}
+                {tab!=="convert" && tab!=="spending" && singles.length>0 && <button onClick={()=>openQuickAdd()} title="Add purchase (N)" style={{ display:"flex", alignItems:"center", gap:7, padding:"10px 16px", borderRadius:11, border:"none", background:`linear-gradient(90deg, ${C.greenDim}, ${C.green})`, color:"#06281d", fontSize:14, fontWeight:700, cursor:"pointer" }}><Plus size={17} /> Add purchase</button>}
               </div>
               <div key={tab+activePeriod.id} style={{ animation:"fadeSlide 0.28s ease" }}>
-                {tab==="dashboard" && <Dashboard data={view} computed={computed} />}
-                {tab==="spending" && <SpendingView data={view} computed={computed} addTransaction={addTransaction} removeTransaction={removeTransaction} updateTransaction={updateTransaction} readOnly={readOnly} travel={travel} setTravel={setTravel} store={store} />}
-                {tab==="convert" && <ConvertView computed={computed} travel={travel} setTravel={setTravel} />}
-                {tab==="calendar" && <CalendarView data={view} store={store} />}
-                {tab==="budget" && <BudgetView data={view} update={update} clearTransactions={clearTransactions} computed={computed} addAllocation={addAllocation} updateAllocation={updateAllocation} removeAllocation={removeAllocation} readOnly={readOnly} travel={travel} recurring={store.recurring} addRecurring={addRecurring} updateRecurring={updateRecurring} removeRecurring={removeRecurring} applyRecurring={applyRecurring} />}
+                {tab==="dashboard" && periodEnded && <PeriodEndedCard period={activePeriod} carry={carryOver} setCarry={setCarryOver} carryAmount={carryAmount} onStart={()=>createPeriod()} />}
+                {tab==="dashboard" && <Dashboard data={view} computed={computed} readOnly={readOnly} updateSpendAlloc={updateSpendAlloc} onEditCategories={editCategories} />}
+                {tab==="spending" && <SpendingView data={view} computed={computed} addTransaction={addTransaction} removeTransaction={removeTransaction} updateTransaction={updateTransaction} readOnly={readOnly} travel={travel} store={store} />}
+                {tab==="convert" && <ConvertView computed={computed} travel={travel} setTravel={setTravel} onRefreshRate={()=>refreshRate(true)} />}
+                {tab==="calendar" && <CalendarView data={view} store={store} onUpdateTx={updateTransaction} onRemoveTx={removeTransaction} onAddOnDay={singles.length ? openQuickAdd : null} />}
+                {tab==="budget" && <BudgetView data={view} update={update} clearTransactions={clearTransactions} computed={computed} addAllocation={addAllocation} updateAllocation={updateAllocation} removeAllocation={removeAllocation} readOnly={readOnly} travel={travel} recurring={store.recurring} addRecurring={addRecurring} updateRecurring={updateRecurring} removeRecurring={removeRecurring} applyRecurring={applyRecurring} addSpendAlloc={addSpendAlloc} updateSpendAlloc={updateSpendAlloc} removeSpendAlloc={removeSpendAlloc} />}
               </div>
             </div>
           </div>
-          {periodsOpen && <PeriodModal store={store} onClose={()=>setPeriodsOpen(false)} onSwitch={switchPeriod} onCreate={createPeriod} onDelete={deletePeriod} onCombine={combinePeriods} onArchive={archivePeriod} />}
-          {settingsOpen && <SettingsModal themeMode={themeMode} setThemeMode={setThemeMode} accent={accent} setAccent={setAccent} store={store} onReset={resetAllData} onRestore={restoreData} onClose={()=>setSettingsOpen(false)} travel={travel} setTravel={setTravel} />}
-          {toast && <Toast message={toast.message} undo={toast.undo} onClose={()=>setToast(null)} />}
+          {periodsOpen && <PeriodModal store={store} onClose={()=>setPeriodsOpen(false)} onSwitch={switchPeriod} onCreate={()=>createPeriod()} onDelete={deletePeriod} onCombine={combinePeriods} onArchive={archivePeriod} carry={carryOver} setCarry={setCarryOver} carryAmount={carryAmount} />}
+          {quickPeriod && <QuickAddModal key={quickAdd.pid + (quickAdd.day || "")} period={quickPeriod} store={store} travel={travel} addTransaction={(t)=>addTransaction(t, quickAdd.pid)} presetDay={quickAdd.day} isActive={quickAdd.pid===activePeriod.id} onClose={()=>setQuickAdd(null)} />}
+          {settingsOpen && <SettingsModal themeMode={themeMode} setThemeMode={setThemeMode} accent={accent} setAccent={setAccent} store={store} onReset={resetAllData} onRestore={restoreData} onClose={()=>setSettingsOpen(false)} travel={travel} setTravel={setTravel} user={user} showToast={showToast} />}
+          {toast && <Toast message={toast.message} note={toast.note} undo={toast.undo} onClose={()=>setToast(null)} />}
+          {showOnboarding && <Onboarding onDone={finishOnboarding} />}
         </div>
       );
     }
