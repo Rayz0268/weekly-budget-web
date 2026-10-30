@@ -734,6 +734,15 @@ function loadStore() {
   } catch (e) {}
   return DEFAULT_DATA;
 }
+// True when nothing has been entered yet: one untouched period with no amounts, purchases or
+// categories. A saved-but-blank store (e.g. left by an older version) still counts as a new user.
+function isBlankStore(s) {
+  if (!s || (s.recurring || []).length || s.periods.length !== 1) return !s;
+  const p = s.periods[0];
+  if (p.type !== "single") return false;
+  const nums = ["startingBalance", "totalIncome", "savings", "gasBudget", "insurance", "endGoal"];
+  return nums.every(k => !p[k]) && !(p.transactions || []).length && !(p.allocations || []).length && !(p.spendingAllocations || []).length;
+}
 const fmt = n => {
   const v = isNaN(n) ? 0 : n;
   return (v < 0 ? "-$" : "$") + Math.abs(v).toLocaleString("en-US", {
@@ -8028,11 +8037,11 @@ function App() {
   const [periodsOpen, setPeriodsOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(() => {
-    // Existing users (data already saved here) skip the intro.
+    // Existing users (real budget data already saved here) skip the intro; anyone else gets it.
     try {
-      return !localStorage.getItem(ONBOARD_KEY) && !localStorage.getItem(STORAGE_KEY);
+      return !localStorage.getItem(ONBOARD_KEY) && isBlankStore(store);
     } catch (e) {
-      return false;
+      return true;
     }
   });
   const finishOnboarding = () => {

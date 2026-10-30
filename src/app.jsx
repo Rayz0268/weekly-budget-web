@@ -303,7 +303,16 @@
       try { const raw = localStorage.getItem(STORAGE_KEY); if (raw) { const n = normalize(JSON.parse(raw)); if (n) return n; } } catch (e) {}
       return DEFAULT_DATA;
     }
-    const fmt = (n) => { const v = isNaN(n) ? 0 : n; return (v<0?"-$":"$") + Math.abs(v).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2}); };
+    // True when nothing has been entered yet: one untouched period with no amounts, purchases or
+    // categories. A saved-but-blank store (e.g. left by an older version) still counts as a new user.
+    function isBlankStore(s) {
+      if (!s || (s.recurring || []).length || s.periods.length !== 1) return !s;
+      const p = s.periods[0];
+      if (p.type !== "single") return false;
+      const nums = ["startingBalance","totalIncome","savings","gasBudget","insurance","endGoal"];
+      return nums.every((k)=>!p[k]) && !(p.transactions||[]).length && !(p.allocations||[]).length && !(p.spendingAllocations||[]).length;
+    }
+    const fmt =(n) => { const v = isNaN(n) ? 0 : n; return (v<0?"-$":"$") + Math.abs(v).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2}); };
     const fmtSigned = (n) => (n>=0?"+$":"-$") + Math.abs(n).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2});
     // Format a foreign-currency amount (no decimals for yen/won, 2 otherwise).
     const fmtForeign = (n, symbol, code) => (symbol||"") + (isNaN(n)?0:n).toLocaleString("en-US",{maximumFractionDigits: code==="JPY"||code==="KRW"?0:2});
@@ -2326,8 +2335,8 @@
       const [periodsOpen, setPeriodsOpen] = useState(false);
       const [settingsOpen, setSettingsOpen] = useState(false);
       const [showOnboarding, setShowOnboarding] = useState(()=>{
-        // Existing users (data already saved here) skip the intro.
-        try { return !localStorage.getItem(ONBOARD_KEY) && !localStorage.getItem(STORAGE_KEY); } catch(e){ return false; }
+        // Existing users (real budget data already saved here) skip the intro; anyone else gets it.
+        try { return !localStorage.getItem(ONBOARD_KEY) && isBlankStore(store); } catch(e){ return true; }
       });
       const finishOnboarding = () => { try { localStorage.setItem(ONBOARD_KEY, "1"); } catch(e){} setShowOnboarding(false); };
       const [themeMode, setThemeMode] = useState(()=>{ try { return localStorage.getItem(THEME_KEY)||"dark"; } catch(e){ return "dark"; } });
