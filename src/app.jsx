@@ -37,6 +37,7 @@
       archive: `<rect x="3" y="3" width="18" height="4" rx="1"/><path d="M5 7v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7"/><line x1="10" y1="12" x2="14" y2="12"/>`,
       search: `<circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.2" y2="16.2"/>`,
       clock: `<circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.5 14"/>`,
+      bank: `<path d="M3 9.5 12 4l9 5.5"/><line x1="4" y1="20" x2="20" y2="20"/><line x1="6" y1="10.5" x2="6" y2="17"/><line x1="10" y1="10.5" x2="10" y2="17"/><line x1="14" y1="10.5" x2="14" y2="17"/><line x1="18" y1="10.5" x2="18" y2="17"/>`,
     };
     function Icon({ name, size = 20, color = "currentColor", strokeWidth = 2, style }) {
       return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round" style={style} dangerouslySetInnerHTML={{ __html: ICONS[name] || "" }} />;
@@ -49,7 +50,7 @@
       CalendarDays=mk("calendar"), AlertTriangle=mk("alert"), Pencil=mk("edit"), Cog=mk("cog"),
       Sun=mk("sun"), Moon=mk("moon"), Contrast=mk("contrast"), Download=mk("download"),
       Reimburse=mk("reimburse"), Plane=mk("plane"), LogOut=mk("logout"), Cloud=mk("cloud"), CloudOff=mk("cloudoff"),
-      Repeat=mk("repeat"), ArrowLeftRight=mk("swap"), Archive=mk("archive"), Search=mk("search"), Clock=mk("clock");
+      Repeat=mk("repeat"), ArrowLeftRight=mk("swap"), Archive=mk("archive"), Search=mk("search"), Clock=mk("clock"), Bank=mk("bank");
     function GoogleG({ size = 18 }) {
       return (
         <svg width={size} height={size} viewBox="0 0 48 48">
@@ -164,6 +165,152 @@
     const newestFirst = (txs) => txs.map((t,i)=>[t,i]).sort((a,b)=>((b[0].date||0)-(a[0].date||0)) || (b[1]-a[1])).map((x)=>x[0]);
     const reinsert = (arr, idx, item) => { const a = (arr||[]).slice(); a.splice(Math.min(idx, a.length), 0, item); return a; };
 
+    /* ---------- Accounts ---------- */
+    // The main account is the one the pay-period budget runs out of: paychecks land there and
+    // purchases come out of it. Other accounts (Savings…) get money from the Budget tab's Savings
+    // line, and from allocations held there until they're marked paid.
+    const PRIMARY_ID = "checking";
+    function defaultAccounts() {
+      return [
+        { id: PRIMARY_ID, name: "Checking", kind: "checking" },
+        { id: "savings", name: "Savings", kind: "savings", color: "#60a5fa" },
+      ];
+    }
+    const ACCOUNT_KINDS = [{ key: "checking", label: "Checking" }, { key: "savings", label: "Savings" }, { key: "other", label: "Other" }];
+    const acctColor = (a) => (!a || a.id === PRIMARY_ID ? C.green : a.color || C.accent);
+    const nextAcctColor = (list) => SPEND_COLORS.find((c) => !(list || []).some((a) => (a.color || "").toLowerCase() === c)) || SPEND_COLORS[0];
+
+    // Purchases paid from a travel-cash allowance don't come out of an account.
+    function isCashTx(p) {
+      if (p.type === "archived") return (t) => !!t.cash;
+      const cl = p.cashLimit || {};
+      return (t) => !!cl.enabled && t.foreignCode === cl.code && !!t.foreignAmount;
+    }
+
+    // The parts of a pay period that move money between accounts. Archived periods keep a copy.
+    function balanceInputs(p) {
+      if (!p) return null;
+      if (p.type === "archived") return p.bal || null;
+      if (p.type !== "single") return null;
+      const cl = p.cashLimit || {};
+      return {
+        startingBalance: p.startingBalance || 0, totalIncome: p.totalIncome || 0, savings: p.savings || 0, savingsTo: p.savingsTo,
+        insurance: p.insurance || 0,
+        cashSetAside: cl.enabled && cl.rate > 0 ? Math.round(((cl.amount || 0) / cl.rate) * 100) / 100 : 0,
+        allocations: (p.allocations || []).map((a) => ({ id: a.id, name: a.name, amount: a.amount || 0, accountId: a.accountId, paidAt: a.paidAt })),
+      };
+    }
+
+    // Where a period's Savings line goes: the account picked for it, else the first savings
+    // account. "" means it isn't tracked in any account.
+    function savingsTarget(savingsTo, accounts) {
+      if (savingsTo === "") return null;
+      if (savingsTo && savingsTo !== PRIMARY_ID && accounts.some((a) => a.id === savingsTo)) return savingsTo;
+      const s = accounts.find((a) => a.id !== PRIMARY_ID && a.kind === "savings");
+      return s ? s.id : null;
+    }
+
+    // Every balance change the app knows about, per account, oldest first, each with the running
+    // balance after it. "Anchors" set a balance outright — the main account's starting balance at
+    // the start of each pay period, or a balance you reported — and everything else moves money.
+    function accountLedger(store) {
+      const accounts = store.accounts || [];
+      const by = {};
+      accounts.forEach((a) => { by[a.id] = []; });
+      const ev = [];
+      const add = (acct, date, amount, label, extra) => {
+        if (!by[acct] || (!amount && !(extra && extra.anchor))) return;
+        ev.push({ acct, date, amount, label, order: 1, ...extra });
+      };
+      store.periods.forEach((p) => {
+        const b = balanceInputs(p);
+        if (!b) return;
+        const start = startOfDay(p.startDate), src = p.period;
+        add(PRIMARY_ID, start, b.startingBalance, "Starting balance", { anchor: true, order: 0, src });
+        add(PRIMARY_ID, start, b.totalIncome, "Income", { src });
+        if (b.savings) {
+          const to = savingsTarget(b.savingsTo, accounts);
+          add(PRIMARY_ID, start, -b.savings, to ? "Savings → " + (accounts.find((a) => a.id === to) || {}).name : "Savings", { src });
+          if (to) add(to, start, b.savings, "Savings", { src });
+        }
+        add(PRIMARY_ID, start, -b.insurance, "Insurance", { src });
+        add(PRIMARY_ID, start, -b.cashSetAside, "Travel cash", { src });
+        (b.allocations || []).forEach((a) => {
+          const amt = a.amount || 0;
+          if (!amt) return;
+          const hold = a.accountId && by[a.accountId] ? a.accountId : null;
+          const name = (a.name || "").trim() || "Allocation";
+          if (hold !== PRIMARY_ID) add(PRIMARY_ID, start, -amt, hold ? name + " → " + (accounts.find((x) => x.id === hold) || {}).name : name, { src });
+          if (hold && hold !== PRIMARY_ID) add(hold, start, amt, name + " (set aside)", { src });
+          if (hold && a.paidAt) add(hold, a.paidAt, -amt, name + " paid", { src });
+        });
+        const cash = isCashTx(p);
+        (p.transactions || []).forEach((t) => {
+          if (cash(t)) return;
+          add(PRIMARY_ID, t.date || start, (isRefundCat(t.category) ? 1 : -1) * (t.amount || 0), t.merchant || catLabel(t.category), { tx: true, src });
+        });
+      });
+      (store.balanceLog || []).forEach((x) => add(x.accountId, x.date, x.balance, "Balance updated", { anchor: true, order: 2, logId: x.id }));
+      ev.sort((a, b) => (a.date - b.date) || (a.order - b.order));
+      ev.forEach((e) => by[e.acct].push(e));
+      Object.keys(by).forEach((k) => {
+        let bal = 0;
+        by[k].forEach((e) => { bal = e.anchor ? e.amount : bal + e.amount; e.bal = Math.round(bal * 100) / 100; });
+      });
+      return by;
+    }
+    const balanceAt = (list, ts) => { let v = null; for (let i = 0; i < list.length && list[i].date <= ts; i++) v = list[i].bal; return v; };
+
+    const BAL_RANGES = [
+      { key: "week", label: "Week", days: 7, note: "past 7 days" },
+      { key: "month", label: "Month", days: 30, note: "past 30 days" },
+      { key: "year", label: "Year", days: 365, note: "past year" },
+      { key: "all", label: "All", note: "all time" },
+    ];
+    // End-of-day balances over a range (today = right now), thinned to ≤ ~370 points for long histories.
+    function balanceSeries(list, range, now) {
+      const today = startOfDay(now);
+      let from = range.days ? addDays(today, -(range.days - 1)) : today;
+      if (!range.days) { const first = list.find((e) => e.date <= now); if (first) from = startOfDay(first.date); }
+      const span = Math.round((today - from) / DAY) + 1;
+      const step = Math.max(1, Math.ceil(span / 370));
+      const days = [];
+      for (let d = from; d < today; d = addDays(d, step)) days.push(d);
+      days.push(today);
+      const pts = [];
+      let i = 0, bal = null;
+      days.forEach((d) => {
+        const end = d === today ? now : addDays(d, 1) - 1;
+        while (i < list.length && list[i].date <= end) bal = list[i++].bal;
+        pts.push({ t: d, v: bal });
+      });
+      return pts;
+    }
+
+    // Allocations set aside in an account and waiting to be paid, from every pay period.
+    function heldAllocations(store) {
+      const ids = new Set((store.accounts || []).map((a) => a.id));
+      const out = [];
+      store.periods.forEach((p) => {
+        const b = balanceInputs(p);
+        if (!b) return;
+        (b.allocations || []).forEach((a) => { if (a.accountId && ids.has(a.accountId) && (a.amount || 0) > 0) out.push({ pid: p.id, period: p.period, start: p.startDate, alloc: a }); });
+      });
+      return out.sort((a, b) => b.start - a.start);
+    }
+
+    // Dialogs close on Escape (the Android app's back button does this there).
+    function useBackHandler(active, handler) {
+      const ref = useRef(handler);
+      ref.current = handler;
+      useEffect(() => {
+        if (!active) return;
+        const onKey = (e) => { if (e.key === "Escape") ref.current(); };
+        window.addEventListener("keydown", onKey);
+        return () => window.removeEventListener("keydown", onKey);
+      }, [active]);
+    }
+
     function makePeriod(o = {}) {
       return { id:"p"+Date.now()+Math.random().toString(36).slice(2,6), type:"single", createdAt:Date.now(),
         period:"New Pay Period", startDate:startOfDay(Date.now()), lengthDays:14, startingBalance:0,
@@ -194,18 +341,26 @@
     // config, allocations, foreign-currency fields, notes, etc. to save storage.
     function makeArchivedPeriod(p) {
       const st = computeStats(p);
+      const cash = isCashTx(p);
       return {
         id: p.id, type: "archived", createdAt: p.createdAt || Date.now(), archivedAt: Date.now(),
         period: p.period, startDate: p.startDate, lengthDays: p.lengthDays || 14,
         summary: { spent: st.spent, remaining: st.remainingSpending, income: p.totalIncome || 0, reimbursed: st.reimbursed, gasSpent: st.gasSpent, txCount: (p.transactions || []).length },
-        transactions: (p.transactions || []).map((t) => ({ id: t.id, date: t.date, amount: t.amount, category: t.category, merchant: t.merchant })),
+        // What the Accounts tab needs to keep charting this period's money (and to mark a held
+        // allocation paid later on).
+        bal: balanceInputs(p),
+        transactions: (p.transactions || []).map((t) => {
+          const out = { id: t.id, date: t.date, amount: t.amount, category: t.category, merchant: t.merchant };
+          if (cash(t)) out.cash = true; // paid from travel cash, not the account
+          return out;
+        }),
       };
     }
     // Brand-new users start with a single empty period (no sample spending).
     // Existing users are unaffected: loadStore() returns their saved data and only
     // falls back to this when there is nothing in localStorage.
     function defaultData() {
-      return { activePeriodId:"p1", recurring:[], periods:[{ id:"p1", type:"single", createdAt:Date.now(), period:"My Pay Period",
+      return { activePeriodId:"p1", recurring:[], accounts:defaultAccounts(), balanceLog:[], periods:[{ id:"p1", type:"single", createdAt:Date.now(), period:"My Pay Period",
         startDate:startOfDay(Date.now()), lengthDays:14, startingBalance:0, totalIncome:0, savings:0, gasBudget:0,
         insurance:0, endGoal:0, allocations:[], spendingAllocations:[], transactions:[] }] };
     }
@@ -225,9 +380,18 @@
         transactions: (p.transactions||[]).map((t)=>({ ...t, date: t.date || startDate })),
         cashLimit: { enabled:false, standalone:false, code:"JPY", symbol:"¥", amount:0, rate:150, ...(p.cashLimit||{}) } };
     }
+    // Budgets saved before accounts existed get Checking + Savings (fixed ids, so two devices
+    // upgrading separately end up with the same accounts).
+    function normalizeAccounts(list) {
+      const accts = (Array.isArray(list) ? list : []).filter((a)=>a && a.id);
+      if (!accts.length) return defaultAccounts();
+      if (!accts.some((a)=>a.id===PRIMARY_ID)) return [defaultAccounts()[0], ...accts];
+      return accts;
+    }
     function normalize(raw) {
-      if (raw && Array.isArray(raw.periods) && raw.periods.length) return { ...raw, recurring: Array.isArray(raw.recurring) ? raw.recurring : [], periods: raw.periods.map(normalizePeriod) };
-      if (raw && Array.isArray(raw.transactions)) { const id="p_migrated"; return { activePeriodId:id, recurring:[], periods:[normalizePeriod({ id, createdAt:Date.now(), ...raw })] }; }
+      if (raw && Array.isArray(raw.periods) && raw.periods.length) return { ...raw, recurring: Array.isArray(raw.recurring) ? raw.recurring : [], accounts: normalizeAccounts(raw.accounts),
+        balanceLog: Array.isArray(raw.balanceLog) ? raw.balanceLog : [], periods: raw.periods.map(normalizePeriod) };
+      if (raw && Array.isArray(raw.transactions)) { const id="p_migrated"; return { activePeriodId:id, recurring:[], accounts:defaultAccounts(), balanceLog:[], periods:[normalizePeriod({ id, createdAt:Date.now(), ...raw })] }; }
       return null;
     }
     // A "combined" period is a read-only monthly rollup of 2–4 single periods.
@@ -267,6 +431,7 @@
     const syncBase = (s) => ({
       p: s.periods.map((p)=>p.id),
       t: [].concat(...s.periods.map((p)=>(p.transactions||[]).map((t)=>t.id))),
+      b: (s.balanceLog||[]).map((x)=>x.id),
     });
 
     // Both devices edited since they last synced. Settings, budgets and names come from `win`
@@ -291,7 +456,12 @@
         else if (!bp.has(p.id)) periods.push(p); // new on `win`; otherwise `lose` deleted it
       });
       const loseNew = lose.periods.filter((p)=>!winIds.has(p.id) && !bp.has(p.id));
-      const merged = { ...win, periods:[...loseNew, ...periods] };
+      // Reported account balances merge like purchases: additions and deletions on both sides are kept.
+      const bb = new Set((base && base.b) || []);
+      const wl = win.balanceLog || [], ll = lose.balanceLog || [];
+      const wlIds = new Set(wl.map((x)=>x.id)), llIds = new Set(ll.map((x)=>x.id));
+      const balanceLog = [...wl.filter((x)=>llIds.has(x.id) || !bb.has(x.id)), ...ll.filter((x)=>!wlIds.has(x.id) && !bb.has(x.id))];
+      const merged = { ...win, periods:[...loseNew, ...periods], balanceLog };
       if (!merged.periods.length) return win;
       if (!merged.periods.some((p)=>p.id===merged.activePeriodId)) {
         merged.activePeriodId = (merged.periods.find((p)=>p.type==="single") || merged.periods[0]).id;
@@ -375,10 +545,13 @@
         if (over > 0) { catOver[a.id] = over; spillover += over; }
       });
       spillover = Math.round(spillover * 100) / 100;
-      return { spendAllocTotal, unallocatedSpending: spendingLimit - spendAllocTotal, catSpent, otherSpent, catOver, spillover,
+      const projectedLeftover = afterCash - spent + reimbursed + (p.gasBudget - gasSpent + gasReimbursed);
+      // Allocations held in the main account stay in it until they're marked paid.
+      const heldInMain = (p.allocations||[]).reduce((s,a)=>s+(a.accountId===PRIMARY_ID && !a.paidAt ? (a.amount||0) : 0), 0);
+      return { currentBalance: projectedLeftover + heldInMain, heldInMain, spendAllocTotal, unallocatedSpending: spendingLimit - spendAllocTotal, catSpent, otherSpent, catOver, spillover,
         spent, gasSpent, gasReimbursed, reimbursed, allocTotal, available, afterSavings, afterGas, afterInsurance, afterAlloc, afterCash, rawLimit, spendingLimit,
         remainingSpending: spendingLimit - spent + reimbursed, remainingGas: p.gasBudget - gasSpent + gasReimbursed,
-        projectedLeftover: afterCash - spent + reimbursed + (p.gasBudget - gasSpent + gasReimbursed),
+        projectedLeftover,
         cashOn, cashSpent, cashReimbursed, cashLimitAmt, cashRemaining, cashSetAside, cashStandalone: cashOn && !!cl.standalone };
     }
 
@@ -720,7 +893,9 @@
     }
 
     /* ================= Dashboard ================= */
-    function Dashboard({ data, computed, readOnly, updateSpendAlloc, onEditCategories }) {
+    function Dashboard({ data, computed, readOnly, updateSpendAlloc, onEditCategories, accounts = [] }) {
+      const mainName = (accounts.find((a)=>a.id===PRIMARY_ID) || {}).name;
+      const acctName = (id) => (accounts.find((a)=>a.id===id) || {}).name;
       const { available, afterInsurance, spent, spendingLimit, remainingSpending, gasSpent, gasReimbursed, remainingGas, projectedLeftover, reimbursed,
         cashOn, cashSpent, cashReimbursed, cashLimitAmt, cashRemaining, cashSetAside, cashStandalone, unallocatedSpending, catSpent, otherSpent, catOver, spillover } = computed;
       const cl = data.cashLimit || {};
@@ -812,7 +987,11 @@
         { label:"Insurance", icon:<Shield size={15} />, delta:-data.insurance, running:afterInsurance },
       ];
       let _run = afterInsurance;
-      (data.allocations||[]).forEach((a)=>{ _run -= (a.amount||0); rows.push({ label:a.name||"Allocation", icon:<DollarSign size={15} />, delta:-(a.amount||0), running:_run }); });
+      (data.allocations||[]).forEach((a)=>{
+        _run -= (a.amount||0);
+        const held = a.accountId && acctName(a.accountId);
+        rows.push({ label:a.name||"Allocation", sub: held ? (a.paidAt ? "paid "+fmtMonthDay(a.paidAt) : "held in "+held+" until paid") : null, icon:<DollarSign size={15} />, delta:-(a.amount||0), running:_run });
+      });
       if (cashOn && cashSetAside > 0) { _run -= cashSetAside; rows.push({ label:`Travel cash (${fmtForeign(cashLimitAmt, cl.symbol, cl.code)})`, icon:<Plane size={15} />, delta:-cashSetAside, running:_run }); }
       return (
         <div style={{ display:"flex", flexDirection:"column", gap:20 }}>
@@ -830,7 +1009,7 @@
                 <KpiCard icon={<DollarSign size={16} />} label="Spending limit" value={fmt(spendingLimit)} sub="this period" />
                 {cashOn
                   ? <KpiCard icon={<Plane size={16} color={C.amber} />} label={cl.code + " cash left"} value={fmtForeign(cashRemaining, cl.symbol, cl.code)} color={cashOver?C.red:C.amber} sub={`${fmtForeign(cashSpent, cl.symbol, cl.code)} of ${fmtForeign(cashLimitAmt, cl.symbol, cl.code)} used`} />
-                  : <KpiCard icon={<Target size={16} />} label="Projected leftover" value={fmt(projectedLeftover)} color={C.amber} sub={aboveGoal>=0?`${fmt(aboveGoal)} over goal`:`${fmt(Math.abs(aboveGoal))} below goal`} />}
+                  : <KpiCard icon={<Wallet size={16} />} label="Current balance" value={fmt(computed.currentBalance)} color={C.amber} sub={aboveGoal>=0?`${fmt(aboveGoal)} over goal`:`${fmt(Math.abs(aboveGoal))} below goal`} />}
                 <KpiCard icon={<Fuel size={16} />} label="Gas remaining" value={fmt(remainingGas)} color={C.accent2} sub={`${fmt(gasSpent-gasReimbursed)} of ${fmt(data.gasBudget)} used`} />
               </React.Fragment>
             )}
@@ -875,7 +1054,7 @@
                 {rows.map((r,i)=>(
                   <div key={i} style={{ display:"flex", alignItems:"center", padding:"10px 0", borderBottom: i<rows.length-1?`1px solid ${C.border}`:"none" }}>
                     <div style={{ color:C.muted, marginRight:10, display:"flex" }}>{r.icon}</div>
-                    <div style={{ flex:1, fontSize:14, color:C.text }}>{r.label}</div>
+                    <div style={{ flex:1, minWidth:0, fontSize:14, color:C.text }}>{r.label}{r.sub && <div style={{ fontSize:11, color:C.muted, marginTop:1 }}>{r.sub}</div>}</div>
                     {r.delta!=null && <div style={{ fontSize:13, color:r.pos?C.green:C.red, marginRight:18, minWidth:90, textAlign:"right" }}>{fmtSigned(r.delta)}</div>}
                     <div style={{ fontSize:15, fontWeight:700, minWidth:96, textAlign:"right" }}>{fmt(r.running)}</div>
                   </div>
@@ -907,11 +1086,11 @@
               <React.Fragment>
               <div style={cardStyle}>
                 <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:10 }}>
-                  <div style={{ display:"flex", alignItems:"center", gap:8, fontWeight:600 }}><Target size={17} color={C.amber} /> End Goal</div>
+                  <div style={{ display:"flex", alignItems:"center", gap:8, fontWeight:600 }}><Wallet size={17} color={C.amber} /> Current Balance{mainName && <span style={{ fontSize:12, fontWeight:500, color:C.muted }}>· {mainName}</span>}</div>
                   <div style={{ fontSize:12, color:C.sub }}>Goal {fmt(data.endGoal)}</div>
                 </div>
-                <div style={{ fontSize:30, fontWeight:800, color:C.text, marginBottom:4 }}>{fmt(projectedLeftover)}</div>
-                <div style={{ fontSize:12, color:C.muted, marginBottom:14 }}>projected left after everything — unspent gas ({fmt(remainingGas)}) stays in</div>
+                <div style={{ fontSize:30, fontWeight:800, color:C.text, marginBottom:4 }}>{fmt(computed.currentBalance)}</div>
+                <div style={{ fontSize:12, color:C.muted, marginBottom:14 }}>what's left after savings, insurance, allocations, spending &amp; gas used — unspent gas ({fmt(remainingGas)}) stays in{computed.heldInMain > 0 ? `, and so does ${fmt(computed.heldInMain)} held for bills until you mark them paid` : ""}</div>
                 <Bar fraction={data.endGoal?projectedLeftover/data.endGoal:0} over={projectedLeftover<data.endGoal} />
                 <div style={{ marginTop:10, fontSize:13, fontWeight:600, color:aboveGoal>=0?C.green:C.red, display:"flex", alignItems:"center", gap:6 }}>
                   {aboveGoal>=0 ? <Check size={15} /> : <X size={15} />}{aboveGoal>=0?`${fmt(aboveGoal)} of room left`:`${fmt(Math.abs(aboveGoal))} below goal`}
@@ -1477,10 +1656,34 @@
     }
 
     /* ================= Budget / Setup ================= */
-    function AllocationRow({ a, onUpdate, onRemove }) {
+    // Where an allocation's money goes: paid right away, or set aside in an account until you
+    // mark it paid (e.g. a bill due later in the period, parked in Savings).
+    function AllocationRouting({ a, accounts, onUpdate, onPaid }) {
+      if (!accounts || !accounts.length) return null;
+      const held = a.accountId && accounts.find((x) => x.id === a.accountId);
+      const sel = { background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 8, color: C.sub, fontSize: 12, fontWeight: 600, padding: "6px 8px", outline: "none", maxWidth: "100%" };
+      const chip = (label, color, onClick, bg) => (
+        <button onClick={onClick} style={{ display: "flex", alignItems: "center", gap: 5, padding: "6px 10px", borderRadius: 8, border: `1px solid ${color}`, background: bg || "transparent", color: C.text, fontSize: 12, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" }}>{label}</button>
+      );
+      return (
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginTop: 7, paddingLeft: 23 }}>
+          <select value={held ? held.id : ""} aria-label="Where this money goes"
+            onChange={(e) => onUpdate(a.id, { accountId: e.target.value || undefined, paidAt: undefined })} style={sel}>
+            <option value="">Paid right away</option>
+            {accounts.map((x) => <option key={x.id} value={x.id}>Hold in {x.name || "account"} until paid</option>)}
+          </select>
+          {held && (a.paidAt
+            ? chip(<React.Fragment><Check size={13} color={C.green} /> Paid {fmtMonthDay(a.paidAt)} · undo</React.Fragment>, C.border, () => onPaid(a.id, null))
+            : chip(<React.Fragment><Clock size={13} color={C.amber} /> Mark paid</React.Fragment>, "rgba(251,191,36,0.45)", () => onPaid(a.id, Date.now()), "rgba(251,191,36,0.08)"))}
+        </div>
+      );
+    }
+
+    function AllocationRow({ a, onUpdate, onRemove, accounts, onPaid }) {
       const [amt, setAmt] = useState(a.amount ? String(a.amount) : "");
       return (
-        <div style={{ display:"flex", alignItems:"center", gap:8, padding:"9px 0", borderBottom:`1px solid ${C.border}` }}>
+        <div style={{ padding:"9px 0", borderBottom:`1px solid ${C.border}` }}>
+        <div style={{ display:"flex", alignItems:"center", gap:8 }}>
           <span style={{ color:C.muted, display:"flex", flexShrink:0 }}><DollarSign size={15} /></span>
           <input value={a.name} onChange={(e)=>onUpdate(a.id,{ name:e.target.value })} placeholder="Name (e.g. Rent)" style={{ flex:1, minWidth:0, background:C.bg2, border:`1px solid ${C.border}`, borderRadius:10, outline:"none", color:C.text, fontSize:14, padding:"9px 10px" }} />
           <div style={{ display:"flex", alignItems:"center", background:C.bg2, border:`1px solid ${C.border}`, borderRadius:10, padding:"0 8px", width:110, flexShrink:0 }}>
@@ -1488,6 +1691,8 @@
             <input inputMode="decimal" value={amt} onChange={(e)=>{ const v=e.target.value; if(!/^\d*\.?\d*$/.test(v))return; setAmt(v); const n=v===""||v==="."?0:parseFloat(v); onUpdate(a.id,{ amount:isNaN(n)?0:n }); }} placeholder="0.00" style={{ background:"transparent", border:"none", outline:"none", color:C.text, fontSize:14, fontWeight:600, width:"100%", textAlign:"right", padding:"9px 2px" }} />
           </div>
           <button onClick={()=>onRemove(a.id)} style={{ width:30, height:30, borderRadius:8, border:"none", background:"transparent", color:C.muted, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}><X size={15} /></button>
+        </div>
+        <AllocationRouting a={a} accounts={accounts} onUpdate={onUpdate} onPaid={onPaid} />
         </div>
       );
     }
@@ -1578,8 +1783,10 @@
       );
     }
 
-    function BudgetView({ data, update, clearTransactions, computed, addAllocation, updateAllocation, removeAllocation, readOnly, travel, recurring, addRecurring, updateRecurring, removeRecurring, applyRecurring, addSpendAlloc, updateSpendAlloc, removeSpendAlloc }) {
+    function BudgetView({ data, update, clearTransactions, computed, addAllocation, updateAllocation, removeAllocation, readOnly, travel, recurring, addRecurring, updateRecurring, removeRecurring, applyRecurring, addSpendAlloc, updateSpendAlloc, removeSpendAlloc, accounts = [], onAllocPaid }) {
       const [confirming, setConfirming] = useState(false);
+      const sideAccounts = accounts.filter((a)=>a.id!==PRIMARY_ID);
+      const savingsTo = savingsTarget(data.savingsTo, accounts);
       const len = data.lengthDays || 14;
       const cl = data.cashLimit || { enabled:false, standalone:false, code:"JPY", symbol:"¥", amount:0, rate:150 };
       const setCash = (patch) => update({ cashLimit: { ...cl, ...patch } });
@@ -1662,11 +1869,21 @@
             <div style={cardStyle}>
               <div style={sectionTitle}>ALLOCATIONS</div>
               <NumberField label="Savings" icon={<PiggyBank size={15} />} value={data.savings} onChange={(v)=>update({ savings:v })} />
+              {sideAccounts.length > 0 && (
+                <div style={{ display:"flex", alignItems:"center", gap:8, padding:"8px 0 10px 25px", borderBottom:`1px solid ${C.border}`, marginTop:-1 }}>
+                  <span style={{ fontSize:12, color:C.muted }}>Goes to</span>
+                  <select value={savingsTo || ""} aria-label="Savings account" onChange={(e)=>update({ savingsTo:e.target.value })}
+                    style={{ background:C.bg2, border:`1px solid ${C.border}`, borderRadius:8, color:C.sub, fontSize:12, fontWeight:600, padding:"6px 8px", outline:"none" }}>
+                    {sideAccounts.map((x)=><option key={x.id} value={x.id}>{x.name || "Account"}</option>)}
+                    <option value="">Not tracked</option>
+                  </select>
+                </div>
+              )}
               <NumberField label="Gas Budget" icon={<Fuel size={15} />} value={data.gasBudget} onChange={(v)=>update({ gasBudget:v })} />
               <NumberField label="Insurance" icon={<Shield size={15} />} value={data.insurance} onChange={(v)=>update({ insurance:v })} />
-              {(data.allocations||[]).map((a)=><AllocationRow key={a.id} a={a} onUpdate={updateAllocation} onRemove={removeAllocation} />)}
+              {(data.allocations||[]).map((a)=><AllocationRow key={a.id} a={a} onUpdate={updateAllocation} onRemove={removeAllocation} accounts={accounts} onPaid={onAllocPaid} />)}
               <button onClick={()=>addAllocation("")} style={{ width:"100%", padding:"11px 0", borderRadius:11, border:`1px dashed ${C.borderHi}`, background:"transparent", color:C.sub, fontSize:13.5, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:6, marginTop:12 }}><Plus size={16} /> Add allocation</button>
-              <div style={{ fontSize:11.5, color:C.muted, marginTop:8, textAlign:"center" }}>Add custom set-asides like rent, groceries, subscriptions…</div>
+              <div style={{ fontSize:11.5, color:C.muted, marginTop:8, textAlign:"center", lineHeight:1.45 }}>Add custom set-asides like rent, groceries, subscriptions… A bill due later in the period can be held in an account until you mark it paid.</div>
             </div>
             <div style={cardStyle}>
               <div style={{ ...sectionTitle, display:"flex", alignItems:"center", gap:6 }}><Repeat size={14} color={C.accent} /> RECURRING EXPENSES</div>
@@ -2026,7 +2243,7 @@
             <div style={{ ...sectionLabel, marginTop:22 }}>ABOUT</div>
             <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:12, padding:16, textAlign:"center" }}>
               <div style={{ fontSize:14.5, fontWeight:700, color:C.text }}>Weekly Budget — Web</div>
-              <div style={{ fontSize:12.5, color:C.sub, marginTop:3 }}>Version 3.5 · Spending categories, quick add &amp; live rates</div>
+              <div style={{ fontSize:12.5, color:C.sub, marginTop:3 }}>Version 3.6 · Accounts &amp; balance charts</div>
               <div style={{ fontSize:11.5, color:C.muted, marginTop:6 }}>{user ? "Your data is synced to your Google account." : "Your data is stored only in this browser."} Press <strong>N</strong> anywhere to add a purchase.</div>
             </div>
             {backupOpen && <BackupModal store={store} onRestore={onRestore} onClose={()=>setBackupOpen(false)} />}
@@ -2036,12 +2253,344 @@
     }
 
     /* ================= Sidebar ================= */
+    const fmtShort = (n) => {
+      const a = Math.abs(n), s = n < 0 ? "-$" : "$";
+      const trim = (x) => x.toFixed(1).replace(/\.0$/, "");
+      return a >= 1e6 ? s + trim(a / 1e6) + "M" : a >= 1e4 ? s + Math.round(a / 1e3) + "k" : a >= 1e3 ? s + trim(a / 1e3) + "k" : s + Math.round(a);
+    };
+    const fmtAxisDay = (ts, long) => long ? new Date(ts).toLocaleDateString("en-US", { month: "short", year: "2-digit" }) : fmtMonthDay(ts);
+
+    // One account's balance over time: a 2px line with a soft fill, recessive gridlines, and a
+    // crosshair + tooltip on touch/hover.
+    function BalanceChart({ points, color, height = 150 }) {
+      const ref = useRef(null);
+      const [w, setW] = useState(320);
+      const [hover, setHover] = useState(null);
+      const gid = useMemo(() => "g" + uid(), []);
+      const pts = points.filter((p) => p.v != null);
+      const hasData = pts.length > 0;
+      useEffect(() => {
+        const el = ref.current;
+        if (!el) return;
+        const measure = () => setW(el.clientWidth || 320);
+        measure();
+        if (window.ResizeObserver) { const ro = new ResizeObserver(measure); ro.observe(el); return () => ro.disconnect(); }
+        window.addEventListener("resize", measure);
+        return () => window.removeEventListener("resize", measure);
+      }, [hasData]);
+      if (!pts.length) {
+        return <div ref={ref}><div style={{ height, display: "flex", alignItems: "center", justifyContent: "center", color: C.muted, fontSize: 13, textAlign: "center", padding: "0 20px", background: C.bg2, borderRadius: 12 }}>No balance history in this range yet</div></div>;
+      }
+      const padL = 52, padR = 10, padT = 12, padB = 22;
+      const iw = Math.max(10, w - padL - padR), ih = height - padT - padB;
+      const t0 = points[0].t, t1 = points[points.length - 1].t;
+      let lo = Math.min(...pts.map((p) => p.v)), hi = Math.max(...pts.map((p) => p.v));
+      if (hi - lo < 1) { const pad = Math.max(10, Math.abs(hi) * 0.05); lo -= pad; hi += pad; }
+      const padV = (hi - lo) * 0.08; lo -= padV; hi += padV;
+      if (lo < 0 && Math.min(...pts.map((p) => p.v)) >= 0) lo = 0; // don't dip below zero just for padding
+      const x = (t) => padL + (t1 === t0 ? iw / 2 : ((t - t0) / (t1 - t0)) * iw);
+      const y = (v) => padT + (1 - (v - lo) / (hi - lo)) * ih;
+      const line = pts.map((p, i) => (i ? "L" : "M") + x(p.t).toFixed(1) + " " + y(p.v).toFixed(1)).join(" ");
+      const base = padT + ih;
+      const area = line + ` L${x(pts[pts.length - 1].t).toFixed(1)} ${base} L${x(pts[0].t).toFixed(1)} ${base} Z`;
+      const ticks = [hi - padV, (hi + lo) / 2, lo + padV];
+      const long = (t1 - t0) / DAY > 120;
+      const last = pts[pts.length - 1];
+      const onMove = (e) => {
+        const r = ref.current && ref.current.getBoundingClientRect();
+        if (!r) return;
+        const px = e.clientX - r.left;
+        let best = pts[0];
+        pts.forEach((p) => { if (Math.abs(x(p.t) - px) < Math.abs(x(best.t) - px)) best = p; });
+        setHover(best);
+      };
+      const hx = hover ? x(hover.t) : 0;
+      return (
+        <div ref={ref} style={{ position: "relative", height, touchAction: "pan-y", userSelect: "none" }}
+          onPointerMove={onMove} onPointerDown={onMove} onPointerLeave={() => setHover(null)} onPointerCancel={() => setHover(null)}>
+          {/* Absolutely positioned so the SVG never props its container open — the container's
+              width is what we measure. */}
+          <svg width={w} height={height} style={{ display: "block", position: "absolute", left: 0, top: 0 }}>
+            <defs>
+              <linearGradient id={gid} x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={color} stopOpacity="0.22" />
+                <stop offset="100%" stopColor={color} stopOpacity="0" />
+              </linearGradient>
+            </defs>
+            {ticks.map((v, i) => (
+              <g key={i}>
+                <line x1={padL} x2={padL + iw} y1={y(v)} y2={y(v)} stroke={C.border} strokeWidth="1" strokeDasharray={i === 2 ? "" : "2 4"} />
+                <text x={padL - 8} y={y(v) + 3.5} textAnchor="end" fontSize="10.5" fill={C.muted}>{Math.max(Math.abs(hi), Math.abs(lo)) < 1e5 ? (v < 0 ? "-$" : "$") + Math.round(Math.abs(v)).toLocaleString("en-US") : fmtShort(v)}</text>
+              </g>
+            ))}
+            {lo < 0 && hi > 0 && <line x1={padL} x2={padL + iw} y1={y(0)} y2={y(0)} stroke={C.red} strokeOpacity="0.5" strokeWidth="1" strokeDasharray="3 3" />}
+            <path d={area} fill={`url(#${gid})`} />
+            <path d={line} fill="none" stroke={color} strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
+            <text x={padL} y={height - 5} fontSize="10.5" fill={C.muted}>{fmtAxisDay(t0, long)}</text>
+            <text x={padL + iw} y={height - 5} fontSize="10.5" fill={C.muted} textAnchor="end">Today</text>
+            {!hover && <circle cx={x(last.t)} cy={y(last.v)} r="4.5" fill={color} stroke={C.card} strokeWidth="2" />}
+            {hover && (
+              <g>
+                <line x1={hx} x2={hx} y1={padT} y2={base} stroke={C.borderHi} strokeWidth="1" />
+                <circle cx={hx} cy={y(hover.v)} r="4.5" fill={color} stroke={C.card} strokeWidth="2" />
+              </g>
+            )}
+          </svg>
+          {hover && (
+            <div style={{ position: "absolute", top: -6, left: Math.min(Math.max(hx - 60, 0), w - 120), width: 120, pointerEvents: "none", background: C.cardHi, border: `1px solid ${C.borderHi}`, borderRadius: 9, padding: "5px 8px", textAlign: "center", boxShadow: "0 6px 18px rgba(0,0,0,0.3)" }}>
+              <div style={{ fontSize: 10.5, color: C.muted }}>{new Date(hover.t).toLocaleDateString("en-US", { month: "short", day: "numeric", year: long ? "numeric" : undefined })}</div>
+              <div style={{ fontSize: 13, fontWeight: 800, color: C.text }}>{fmt(hover.v)}</div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // Small centered dialog used by the Accounts tab.
+    function Dialog({ title, onClose, children }) {
+      useBackHandler(true, onClose);
+      return (
+        <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 60, display: "flex", alignItems: "center", justifyContent: "center", padding: 20, animation: "fadeIn 0.2s ease" }}>
+          <div onClick={(e) => e.stopPropagation()} style={{ width: "100%", maxWidth: 370, background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 20, padding: 20, maxHeight: "86vh", overflowY: "auto" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
+              <div style={{ flex: 1, minWidth: 0, fontSize: 16.5, fontWeight: 800, color: C.text }}>{title}</div>
+              <button onClick={onClose} aria-label="Close" style={{ width: 30, height: 30, borderRadius: 8, border: "none", background: C.card, color: C.sub, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}><X size={16} /></button>
+            </div>
+            {children}
+          </div>
+        </div>
+      );
+    }
+    const dlgInput = () => ({ width: "100%", background: C.bg, border: `1px solid ${C.border}`, borderRadius: 11, outline: "none", color: C.text, fontSize: 15, padding: "11px 13px" });
+    const dlgLabel = () => ({ fontSize: 12, color: C.muted, margin: "0 0 6px" });
+    const primaryBtn = (enabled = true) => ({ width: "100%", padding: "13px 0", borderRadius: 12, border: "none", background: enabled ? `linear-gradient(90deg, ${C.greenDim}, ${C.green})` : C.card, color: enabled ? "#06281d" : C.muted, fontSize: 15, fontWeight: 700, cursor: enabled ? "pointer" : "default", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 });
+    // A date picked in a dialog: today means "now"; another day sits at noon (DST-safe).
+    const pickedTime = (v) => { const d = fromDateInput(v); return d === startOfDay(Date.now()) ? Date.now() : d + NOON; };
+
+    function MoneyInput({ value, onChange, autoFocus, allowNegative }) {
+      return (
+        <div style={{ display: "flex", alignItems: "center", gap: 6, background: C.bg, border: `1px solid ${C.border}`, borderRadius: 11, padding: "0 13px" }}>
+          <span style={{ color: C.muted, fontSize: 17 }}>$</span>
+          <input inputMode="decimal" autoFocus={autoFocus} value={value} placeholder="0.00"
+            onChange={(e) => { const v = e.target.value; if ((allowNegative ? /^-?\d*\.?\d*$/ : /^\d*\.?\d*$/).test(v)) onChange(v); }}
+            style={{ flex: 1, minWidth: 0, background: "transparent", border: "none", outline: "none", color: C.text, fontSize: 22, fontWeight: 800, padding: "11px 0" }} />
+        </div>
+      );
+    }
+
+    function UpdateBalanceDialog({ account, current, onSave, onClose }) {
+      const [amt, setAmt] = useState(current != null ? String(current) : "");
+      const [day, setDay] = useState(toDateInput(Date.now()));
+      const n = parseFloat(amt);
+      const ok = !isNaN(n) && !!day;
+      const main = account.id === PRIMARY_ID;
+      return (
+        <Dialog title={"Update " + (account.name || "account") + " balance"} onClose={onClose}>
+          <div style={{ fontSize: 12.5, color: C.sub, lineHeight: 1.45, marginBottom: 14 }}>
+            Enter what your bank shows. The chart picks up from this number{main ? " until your next pay period starts, which begins from its own starting balance" : ""}.
+          </div>
+          <div style={dlgLabel()}>Balance</div>
+          <MoneyInput value={amt} onChange={setAmt} autoFocus allowNegative />
+          <div style={{ ...dlgLabel(), marginTop: 14 }}>As of</div>
+          <input type="date" value={day} max={toDateInput(Date.now())} onChange={(e) => setDay(e.target.value)} style={dlgInput()} />
+          <button disabled={!ok} onClick={() => { if (ok) { onSave(Math.round(n * 100) / 100, pickedTime(day)); onClose(); } }} style={{ ...primaryBtn(ok), marginTop: 18 }}><Check size={17} /> Save balance</button>
+        </Dialog>
+      );
+    }
+
+    function MarkPaidDialog({ item, accountName, onSave, onClose }) {
+      const [day, setDay] = useState(toDateInput(Date.now()));
+      const a = item.alloc;
+      return (
+        <Dialog title={"Mark " + ((a.name || "").trim() || "allocation") + " paid"} onClose={onClose}>
+          <div style={{ fontSize: 13, color: C.sub, lineHeight: 1.45, marginBottom: 14 }}><strong style={{ color: C.text }}>{fmt(a.amount)}</strong> comes out of {accountName || "the account"} on the day it was paid.</div>
+          <div style={dlgLabel()}>Paid on</div>
+          <input type="date" value={day} max={toDateInput(Date.now())} onChange={(e) => setDay(e.target.value)} style={dlgInput()} />
+          <button disabled={!day} onClick={() => { if (day) { onSave(pickedTime(day)); onClose(); } }} style={{ ...primaryBtn(!!day), marginTop: 18 }}><Check size={17} /> Mark paid</button>
+        </Dialog>
+      );
+    }
+
+    function AccountDialog({ account, accounts, onSave, onDelete, onClose }) {
+      const isNew = !account;
+      const main = account && account.id === PRIMARY_ID;
+      const [name, setName] = useState(account ? account.name || "" : "");
+      const [kind, setKind] = useState(account ? account.kind || "other" : "savings");
+      const [color, setColor] = useState(account ? account.color || nextAcctColor(accounts) : nextAcctColor(accounts));
+      const [start, setStart] = useState("");
+      const [confirmDel, setConfirmDel] = useState(false);
+      const ok = !!name.trim();
+      const save = () => {
+        if (!ok) return;
+        const n = parseFloat(start);
+        onSave({ ...(account || { id: "acct" + uid() }), name: name.trim(), kind: main ? "checking" : kind, ...(main ? {} : { color }) }, isNew && !isNaN(n) ? Math.round(n * 100) / 100 : null);
+        onClose();
+      };
+      return (
+        <Dialog title={isNew ? "Add account" : "Edit account"} onClose={onClose}>
+          <div style={dlgLabel()}>Name</div>
+          <input value={name} autoFocus={isNew} onChange={(e) => setName(e.target.value)} placeholder="e.g. Emergency fund" style={dlgInput()} />
+          {!main && (
+            <React.Fragment>
+              <div style={{ ...dlgLabel(), marginTop: 14 }}>Type</div>
+              <div style={{ display: "flex", gap: 8 }}>
+                {ACCOUNT_KINDS.map((k) => (
+                  <button key={k.key} onClick={() => setKind(k.key)} style={{ flex: 1, padding: "9px 0", borderRadius: 10, border: `1px solid ${kind === k.key ? C.green : C.border}`, background: kind === k.key ? "rgba(52,211,153,0.12)" : C.bg, color: kind === k.key ? C.text : C.sub, fontSize: 13, fontWeight: 600, cursor: "pointer" }}>{k.label}</button>
+                ))}
+              </div>
+              <div style={{ ...dlgLabel(), marginTop: 14 }}>Color</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 9 }}>
+                {SPEND_COLORS.map((c) => (
+                  <button key={c} onClick={() => setColor(c)} aria-label={"Color " + c} style={{ width: 30, height: 30, borderRadius: 99, background: c, cursor: "pointer", padding: 0, border: `2px solid ${color === c ? C.text : "transparent"}`, boxShadow: color === c ? `inset 0 0 0 2px ${C.bg2}` : "none" }} />
+                ))}
+              </div>
+            </React.Fragment>
+          )}
+          {main && <div style={{ fontSize: 12, color: C.muted, marginTop: 10, lineHeight: 1.45 }}>Your main account — paychecks land here and purchases come out of it.</div>}
+          {isNew && (
+            <React.Fragment>
+              <div style={{ ...dlgLabel(), marginTop: 14 }}>Current balance <span style={{ color: C.muted }}>(optional)</span></div>
+              <MoneyInput value={start} onChange={setStart} allowNegative />
+            </React.Fragment>
+          )}
+          <button disabled={!ok} onClick={save} style={{ ...primaryBtn(ok), marginTop: 18 }}><Check size={17} /> {isNew ? "Add account" : "Save"}</button>
+          {!isNew && !main && (confirmDel ? (
+            <div style={{ marginTop: 12, background: "rgba(248,113,113,0.08)", border: "1px solid rgba(248,113,113,0.3)", borderRadius: 12, padding: 12 }}>
+              <div style={{ fontSize: 13, color: C.text, lineHeight: 1.45, marginBottom: 10 }}>Remove <strong>{account.name}</strong>? Money held in it counts as paid right away, and savings go to your other savings account (if any). You'll get a few seconds to undo.</div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={() => setConfirmDel(false)} style={{ flex: 1, padding: "10px 0", borderRadius: 10, border: `1px solid ${C.border}`, background: "transparent", color: C.sub, fontSize: 13.5, fontWeight: 600, cursor: "pointer" }}>Cancel</button>
+                <button onClick={() => { onDelete(account.id); onClose(); }} style={{ flex: 1, padding: "10px 0", borderRadius: 10, border: "none", background: C.red, color: "#2a0a0a", fontSize: 13.5, fontWeight: 700, cursor: "pointer" }}>Remove</button>
+              </div>
+            </div>
+          ) : (
+            <button onClick={() => setConfirmDel(true)} style={{ width: "100%", marginTop: 10, padding: "11px 0", borderRadius: 12, border: `1px solid ${C.border}`, background: "transparent", color: C.red, fontSize: 13.5, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}><Trash2 size={15} /> Remove account</button>
+          ))}
+        </Dialog>
+      );
+    }
+
+    function AccountCard({ account, list, range, now, onUpdate, onEdit, onRemoveLog }) {
+      const [open, setOpen] = useState(false);
+      const [showAll, setShowAll] = useState(false);
+      const color = acctColor(account);
+      const points = useMemo(() => balanceSeries(list, range, now), [list, range, now]);
+      const current = balanceAt(list, now);
+      const firstPt = points.find((p) => p.v != null);
+      const change = firstPt && current != null ? Math.round((current - firstPt.v) * 100) / 100 : null;
+      const from = points[0].t;
+      const activity = list.filter((e) => e.date <= now && e.date >= from).slice().reverse();
+      const shown = showAll ? activity : activity.slice(0, 6);
+      const main = account.id === PRIMARY_ID;
+      return (
+        <div style={cardStyle}>
+          <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
+            <span style={{ width: 11, height: 11, borderRadius: 99, background: color, flexShrink: 0 }} />
+            <div style={{ flex: 1, minWidth: 0, fontSize: 14.5, fontWeight: 700, color: C.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{account.name || "Account"}</div>
+            {main && <span style={{ fontSize: 10, fontWeight: 700, color: C.sub, background: C.cardHi, border: `1px solid ${C.border}`, padding: "2px 7px", borderRadius: 6, letterSpacing: 0.3 }}>MAIN</span>}
+            <button onClick={onEdit} aria-label={"Edit " + (account.name || "account")} style={{ width: 30, height: 30, borderRadius: 8, border: "none", background: "transparent", color: C.muted, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}><Pencil size={15} /></button>
+          </div>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 10, margin: "4px 0 12px", flexWrap: "wrap" }}>
+            <div style={{ fontSize: 26, fontWeight: 800, color: C.text, letterSpacing: -0.4 }}>{current == null ? "—" : fmt(current)}</div>
+            {change != null && Math.abs(change) >= 0.005 && <div style={{ fontSize: 12.5, fontWeight: 700, color: change > 0 ? C.green : C.red }}>{fmtSigned(change)} <span style={{ color: C.muted, fontWeight: 500 }}>{range.note}</span></div>}
+            {change != null && Math.abs(change) < 0.005 && <div style={{ fontSize: 12.5, color: C.muted }}>no change {range.note}</div>}
+          </div>
+          <BalanceChart points={points} color={color} />
+          <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+            <button onClick={onUpdate} style={{ flex: 1, padding: "10px 0", borderRadius: 11, border: `1px solid ${C.border}`, background: C.cardHi, color: C.text, fontSize: 13, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}><Pencil size={14} /> Update balance</button>
+            <button onClick={() => setOpen((o) => !o)} style={{ flex: 1, padding: "10px 0", borderRadius: 11, border: `1px solid ${C.border}`, background: "transparent", color: C.sub, fontSize: 13, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>Activity <span style={{ display: "flex", transform: open ? "rotate(180deg)" : "none", transition: "transform 0.2s ease" }}><ChevronDown size={15} /></span></button>
+          </div>
+          {current == null && <div style={{ fontSize: 12, color: C.muted, marginTop: 10, textAlign: "center", lineHeight: 1.45 }}>{main ? "Fills in from your pay periods." : "Tap Update balance to enter what's in it today — savings and held bills from your budget add on from there."}</div>}
+          {open && (
+            <div style={{ marginTop: 10 }}>
+              {activity.length === 0 && <div style={{ color: C.muted, fontSize: 13, padding: "12px 0", textAlign: "center" }}>Nothing {range.note}.</div>}
+              {shown.map((e, i) => (
+                <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 0", borderBottom: i < shown.length - 1 ? `1px solid ${C.border}` : "none" }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13.5, color: C.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{e.label}</div>
+                    <div style={{ fontSize: 11, color: C.muted, marginTop: 1, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{fmtMonthDay(e.date)}{e.src ? " · " + e.src : ""} · balance {fmt(e.bal)}</div>
+                  </div>
+                  <div style={{ fontSize: 13.5, fontWeight: 700, color: e.anchor ? C.sub : e.amount > 0 ? C.green : C.text, whiteSpace: "nowrap" }}>{e.anchor ? "= " + fmt(e.amount) : fmtSigned(e.amount)}</div>
+                  {e.logId && <button onClick={() => onRemoveLog(e.logId)} aria-label="Remove this balance update" style={{ width: 26, height: 26, borderRadius: 7, border: "none", background: "transparent", color: C.muted, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}><X size={14} /></button>}
+                </div>
+              ))}
+              {activity.length > shown.length && <button onClick={() => setShowAll(true)} style={{ width: "100%", marginTop: 6, padding: "9px 0", border: "none", background: "transparent", color: C.green, fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Show all {activity.length}</button>}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function AccountsView({ store, onSaveAccount, onDeleteAccount, onAddBalance, onRemoveLog, onMarkPaid }) {
+      const [rangeKey, setRangeKey] = useState("month");
+      const [dialog, setDialog] = useState(null); // { type: "balance"|"edit"|"add"|"paid", ... }
+      const accounts = store.accounts || [];
+      const range = BAL_RANGES.find((r) => r.key === rangeKey) || BAL_RANGES[1];
+      // "Now" is fixed per render pass of this tab so every card's range lines up.
+      const now = useMemo(() => Date.now(), [store, rangeKey]);
+      const ledger = useMemo(() => accountLedger(store), [store]);
+      const held = useMemo(() => heldAllocations(store), [store]);
+      const waiting = held.filter((h) => !h.alloc.paidAt);
+      const nameOf = (id) => (accounts.find((a) => a.id === id) || {}).name || "account";
+      const total = accounts.reduce((s, a) => { const v = balanceAt(ledger[a.id] || [], now); return v == null ? s : s + v; }, 0);
+      const dAcct = dialog && dialog.id && accounts.find((a) => a.id === dialog.id);
+      return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          <div style={{ ...cardStyle, textAlign: "center", padding: "16px 18px" }}>
+            <div style={{ fontSize: 12, color: C.sub, marginBottom: 2 }}>All accounts</div>
+            <div style={{ fontSize: 30, fontWeight: 800, color: C.text, letterSpacing: -0.5 }}>{fmt(total)}</div>
+            <div style={{ fontSize: 11.5, color: C.muted, marginTop: 2 }}>{accounts.map((a) => a.name).filter(Boolean).join(" + ")}</div>
+          </div>
+
+          <div style={{ display: "flex", gap: 4, background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: 4, maxWidth: 420, width: "100%" }}>
+            {BAL_RANGES.map((r) => (
+              <button key={r.key} onClick={() => setRangeKey(r.key)} style={{ flex: 1, padding: "8px 0", borderRadius: 9, border: "none", background: r.key === rangeKey ? C.cardHi : "transparent", color: r.key === rangeKey ? C.text : C.sub, fontSize: 13, fontWeight: r.key === rangeKey ? 700 : 600, cursor: "pointer", boxShadow: r.key === rangeKey ? `inset 0 0 0 1px ${C.borderHi}` : "none" }}>{r.label}</button>
+            ))}
+          </div>
+
+          {waiting.length > 0 && (
+            <div style={{ ...cardStyle, background: "rgba(251,191,36,0.06)", border: "1px solid rgba(251,191,36,0.28)" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 13, fontWeight: 600, color: C.sub, letterSpacing: 0.3, marginBottom: 4 }}><Clock size={14} color={C.amber} /> WAITING TO BE PAID</div>
+              {waiting.map((h, i) => (
+                <div key={h.pid + h.alloc.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 0", borderBottom: i < waiting.length - 1 ? `1px solid ${C.border}` : "none" }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 14, color: C.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{(h.alloc.name || "").trim() || "Allocation"} · <strong>{fmt(h.alloc.amount)}</strong></div>
+                    <div style={{ fontSize: 11.5, color: C.muted, marginTop: 1, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>In {nameOf(h.alloc.accountId)} · {h.period}</div>
+                  </div>
+                  <button onClick={() => setDialog({ type: "paid", item: h })} style={{ padding: "8px 12px", borderRadius: 9, border: "none", background: `linear-gradient(90deg, ${C.greenDim}, ${C.green})`, color: "#06281d", fontSize: 12.5, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap", display: "flex", alignItems: "center", gap: 5 }}><Check size={14} /> Mark paid</button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(min(100%, 420px), 1fr))", gap: 16, alignItems: "start" }}>
+            {accounts.map((a) => (
+              <AccountCard key={a.id} account={a} list={ledger[a.id] || []} range={range} now={now}
+                onUpdate={() => setDialog({ type: "balance", id: a.id })} onEdit={() => setDialog({ type: "edit", id: a.id })} onRemoveLog={onRemoveLog} />
+            ))}
+          </div>
+
+          <button onClick={() => setDialog({ type: "add" })} style={{ width: "100%", padding: "13px 0", borderRadius: 14, border: `1px dashed ${C.borderHi}`, background: "transparent", color: C.sub, fontSize: 14, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+            <Plus size={16} /> Add account
+          </button>
+          <div style={{ fontSize: 11.5, color: C.muted, textAlign: "center", lineHeight: 1.5, marginTop: -6 }}>
+            Balances come from your pay periods: income and purchases move {nameOf(PRIMARY_ID)}, and the Budget tab's Savings line and held allocations move the others. Update a balance any time to match your bank.
+          </div>
+
+          {dialog && dialog.type === "balance" && dAcct && <UpdateBalanceDialog account={dAcct} current={balanceAt(ledger[dAcct.id] || [], Date.now())} onSave={(bal, at) => onAddBalance(dAcct.id, bal, at)} onClose={() => setDialog(null)} />}
+          {dialog && dialog.type === "edit" && dAcct && <AccountDialog account={dAcct} accounts={accounts} onSave={(a) => onSaveAccount(a)} onDelete={onDeleteAccount} onClose={() => setDialog(null)} />}
+          {dialog && dialog.type === "add" && <AccountDialog accounts={accounts} onSave={(a, bal) => { onSaveAccount(a); if (bal != null) onAddBalance(a.id, bal, Date.now(), true); }} onClose={() => setDialog(null)} />}
+          {dialog && dialog.type === "paid" && <MarkPaidDialog item={dialog.item} accountName={nameOf(dialog.item.alloc.accountId)} onSave={(at) => onMarkPaid(dialog.item.pid, dialog.item.alloc.id, at, dialog.item.alloc.name)} onClose={() => setDialog(null)} />}
+        </div>
+      );
+    }
+
     function Sidebar({ tab, setTab, activePeriod, onOpenPeriods, onOpenSettings, account, travelOn }) {
       const nav = [
         { id:"dashboard", label:"Dashboard", icon:Grid },
         { id:"spending", label:"Spending", icon:Receipt },
         travelOn && { id:"convert", label:"Convert", icon:Repeat },
         { id:"calendar", label:"Calendar", icon:CalendarDays },
+        { id:"accounts", label:"Accounts", icon:Bank },
         { id:"budget", label:"Budget", icon:Sliders },
       ].filter(Boolean);
       return (
@@ -2475,6 +3024,48 @@
         removeWithUndo(activePeriod.spendingAllocations, id, (fn)=>updatePeriod(pid, (p)=>({ ...p, spendingAllocations:fn(p.spendingAllocations) })), "Category",
           n ? ` · ${n} purchase${n>1?"s":""} moved to Other` : "");
       };
+      // Accounts — a list on the store; reported balances live in store.balanceLog.
+      const saveAccount = (acct) => setStore((s) => {
+        const list = s.accounts || [];
+        return { ...s, accounts: list.some((a) => a.id === acct.id) ? list.map((a) => (a.id === acct.id ? { ...a, ...acct } : a)) : [...list, acct] };
+      });
+      const deleteAccount = (id) => {
+        if (id === PRIMARY_ID) return;
+        const idx = (store.accounts || []).findIndex((a) => a.id === id);
+        if (idx < 0) return;
+        const acct = store.accounts[idx];
+        const logs = (store.balanceLog || []).filter((b) => b.accountId === id);
+        setStore((s) => ({ ...s, accounts: (s.accounts || []).filter((a) => a.id !== id), balanceLog: (s.balanceLog || []).filter((b) => b.accountId !== id) }));
+        showToast(`"${acct.name || "Account"}" removed`, () => {
+          setStore((s) => ({ ...s, accounts: reinsert(s.accounts, idx, acct), balanceLog: [...(s.balanceLog || []), ...logs] }));
+          setToast(null);
+        });
+      };
+      const addBalance = (accountId, balance, date, quiet) => {
+        const entry = { id: "b" + uid(), accountId, balance, date };
+        setStore((s) => ({ ...s, balanceLog: [...(s.balanceLog || []), entry] }));
+        if (quiet) return;
+        const name = ((store.accounts || []).find((a) => a.id === accountId) || {}).name || "Account";
+        showToast(`${name} set to ${fmt(balance)}`, () => { setStore((s) => ({ ...s, balanceLog: (s.balanceLog || []).filter((x) => x.id !== entry.id) })); setToast(null); });
+      };
+      const removeBalanceLog = (id) => {
+        const item = (store.balanceLog || []).find((x) => x.id === id);
+        if (!item) return;
+        setStore((s) => ({ ...s, balanceLog: (s.balanceLog || []).filter((x) => x.id !== id) }));
+        showToast("Balance update removed", () => { setStore((s) => ({ ...s, balanceLog: [...(s.balanceLog || []), item] })); setToast(null); });
+      };
+      // Held allocations can be marked paid in any period, archived ones included.
+      const setAllocPaid = (pid, aid, paidAt) => updatePeriod(pid, (p) => {
+        const fix = (list) => (list || []).map((a) => (a.id === aid ? { ...a, paidAt: paidAt || undefined } : a));
+        if (p.type === "archived") return p.bal ? { ...p, bal: { ...p.bal, allocations: fix(p.bal.allocations) } } : p;
+        return { ...p, allocations: fix(p.allocations) };
+      });
+      const markPaid = (pid, aid, paidAt, name) => {
+        setAllocPaid(pid, aid, paidAt);
+        const label = (name || "").trim() || "Allocation";
+        showToast(paidAt ? `${label} marked paid` : `${label} back to unpaid`, () => { setAllocPaid(pid, aid, paidAt ? null : Date.now()); setToast(null); });
+      };
+
       // Both replace everything (and sync that everywhere when signed in), so keep the old data for Undo.
       const replaceAllData = (next, message) => {
         const prev = store;
@@ -2492,7 +3083,9 @@
         const sources = singles.filter((p)=>(activePeriod.sourceIds||[]).includes(p.id));
         return (sources.length ? sources : singles).slice().sort((a,b)=>b.startDate-a.startDate)[0] || view;
       };
-      const carryAmount = Math.max(0, Math.round(computeStats(nextSource()).projectedLeftover * 100) / 100);
+      // What's actually in the main account — including bills held there and not paid yet, since
+      // those still come out of it when they're marked paid.
+      const carryAmount = Math.max(0, Math.round(computeStats(nextSource()).currentBalance * 100) / 100);
       // The active period is over and nothing comes after it yet → offer to start the next one.
       const periodEnded = activePeriod.type === "single" && startOfDay(Date.now()) >= periodEnd(activePeriod)
         && !store.periods.some((p)=>p.type==="single" && startOfDay(p.startDate) >= startOfDay(periodEnd(activePeriod)));
@@ -2505,8 +3098,9 @@
           period:"New Pay Period",
           startDate, lengthDays: src.monthly ? monthLength(startDate) : (src.lengthDays||14), monthly: !!src.monthly,
           startingBalance: carry && leftover > 0 ? leftover : src.startingBalance, totalIncome:src.totalIncome,
-          savings:src.savings, gasBudget:src.gasBudget, insurance:src.insurance, endGoal:src.endGoal,
-          allocations:(src.allocations||[]).map((a,i)=>({ id:"a"+Date.now()+i+Math.random().toString(36).slice(2,4), name:a.name, amount:a.amount })),
+          savings:src.savings, savingsTo:src.savingsTo, gasBudget:src.gasBudget, insurance:src.insurance, endGoal:src.endGoal,
+          // Where each allocation goes carries over; whether it's been paid starts fresh.
+          allocations:(src.allocations||[]).map((a,i)=>({ id:"a"+Date.now()+i+Math.random().toString(36).slice(2,4), name:a.name, amount:a.amount, ...(a.accountId ? { accountId:a.accountId } : {}) })),
           spendingAllocations:(src.spendingAllocations||[]).map((a)=>({ id:"s"+uid(), name:a.name, amount:a.amount, color:a.color })),
         });
         const rec = [].concat(...(store.recurring||[]).filter((r)=>r.amount>0).map((r)=>recurringTxFor(np, r)));
@@ -2575,7 +3169,7 @@
         }, 80);
       };
 
-      const titleMap = { dashboard:"Dashboard", spending:"Spending", convert:"Converter", calendar:"Calendar", budget:"Budget" };
+      const titleMap = { dashboard:"Dashboard", spending:"Spending", convert:"Converter", calendar:"Calendar", accounts:"Accounts", budget:"Budget" };
       const travelOn = travel.enabled && travel.rate>0;
 
       return (
@@ -2597,11 +3191,12 @@
               </div>
               <div key={tab+activePeriod.id} style={{ animation:"fadeSlide 0.28s ease" }}>
                 {tab==="dashboard" && periodEnded && <PeriodEndedCard period={activePeriod} carry={carryOver} setCarry={setCarryOver} carryAmount={carryAmount} onStart={()=>createPeriod()} />}
-                {tab==="dashboard" && <Dashboard data={view} computed={computed} readOnly={readOnly} updateSpendAlloc={updateSpendAlloc} onEditCategories={editCategories} />}
+                {tab==="dashboard" && <Dashboard data={view} computed={computed} readOnly={readOnly} updateSpendAlloc={updateSpendAlloc} onEditCategories={editCategories} accounts={store.accounts} />}
                 {tab==="spending" && <SpendingView data={view} computed={computed} addTransaction={addTransaction} removeTransaction={removeTransaction} updateTransaction={updateTransaction} readOnly={readOnly} travel={travel} store={store} />}
                 {tab==="convert" && <ConvertView computed={computed} travel={travel} setTravel={setTravel} onRefreshRate={()=>refreshRate(true)} />}
+                {tab==="accounts" && <AccountsView store={store} onSaveAccount={saveAccount} onDeleteAccount={deleteAccount} onAddBalance={addBalance} onRemoveLog={removeBalanceLog} onMarkPaid={markPaid} />}
                 {tab==="calendar" && <CalendarView data={view} store={store} onUpdateTx={updateTransaction} onRemoveTx={removeTransaction} onAddOnDay={singles.length ? openQuickAdd : null} />}
-                {tab==="budget" && <BudgetView data={view} update={update} clearTransactions={clearTransactions} computed={computed} addAllocation={addAllocation} updateAllocation={updateAllocation} removeAllocation={removeAllocation} readOnly={readOnly} travel={travel} recurring={store.recurring} addRecurring={addRecurring} updateRecurring={updateRecurring} removeRecurring={removeRecurring} applyRecurring={applyRecurring} addSpendAlloc={addSpendAlloc} updateSpendAlloc={updateSpendAlloc} removeSpendAlloc={removeSpendAlloc} />}
+                {tab==="budget" && <BudgetView data={view} update={update} clearTransactions={clearTransactions} computed={computed} addAllocation={addAllocation} updateAllocation={updateAllocation} removeAllocation={removeAllocation} readOnly={readOnly} travel={travel} recurring={store.recurring} addRecurring={addRecurring} updateRecurring={updateRecurring} removeRecurring={removeRecurring} applyRecurring={applyRecurring} addSpendAlloc={addSpendAlloc} updateSpendAlloc={updateSpendAlloc} removeSpendAlloc={removeSpendAlloc} accounts={store.accounts} onAllocPaid={(aid, at)=>markPaid(activePeriod.id, aid, at, ((activePeriod.allocations||[]).find((a)=>a.id===aid)||{}).name)} />}
               </div>
             </div>
           </div>
