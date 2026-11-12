@@ -189,13 +189,70 @@ const THEMES = {
   }
 };
 let C = THEMES.dark;
-const mkCard = () => ({
+// Phone-sized windows get the Android app's layout (header, bottom tabs, bottom sheets).
+// Set by App on every render, before anything below it reads cardStyle.
+const PHONE_QUERY = "(max-width: 860px)";
+let IS_PHONE = false;
+const mkCard = () => IS_PHONE ? {
+  background: C.card,
+  border: `1px solid ${C.border}`,
+  borderRadius: 18,
+  padding: 18
+} : {
   background: C.card,
   border: `1px solid ${C.border}`,
   borderRadius: 16,
   padding: 20
-});
+};
 let cardStyle = mkCard();
+// Overlay + panel styles for dialogs: a centered card on desktop, a bottom sheet on phones.
+const overlayStyle = (zIndex, dim = 0.55) => ({
+  position: "fixed",
+  inset: 0,
+  background: `rgba(0,0,0,${dim})`,
+  zIndex,
+  display: "flex",
+  alignItems: IS_PHONE ? "flex-end" : "center",
+  justifyContent: "center",
+  padding: IS_PHONE ? 0 : 20,
+  animation: "fadeIn 0.2s ease"
+});
+const panelStyle = (maxWidth, extra = {}) => IS_PHONE ? {
+  width: "100%",
+  maxWidth: 440,
+  background: C.bg2,
+  borderTopLeftRadius: 22,
+  borderTopRightRadius: 22,
+  borderTop: `1px solid ${C.border}`,
+  padding: "10px 18px 18px",
+  paddingBottom: "calc(18px + env(safe-area-inset-bottom))",
+  maxHeight: "86vh",
+  overflowY: "auto",
+  animation: "sheetUp 0.28s cubic-bezier(0.22,1,0.36,1)",
+  ...extra
+} : {
+  width: "100%",
+  maxWidth,
+  background: C.bg2,
+  border: `1px solid ${C.border}`,
+  borderRadius: 18,
+  padding: 22,
+  maxHeight: "88vh",
+  overflowY: "auto",
+  animation: "popIn 0.2s ease",
+  ...extra
+};
+const SheetHandle = ({
+  mb = 16
+}) => IS_PHONE ? /*#__PURE__*/React.createElement("div", {
+  style: {
+    width: 38,
+    height: 4,
+    borderRadius: 99,
+    background: C.borderHi,
+    margin: `6px auto ${mb}px`
+  }
+}) : null;
 
 // Accent (brand) colors — override the default emerald. "green" keeps each theme's tuned default.
 const ACCENTS = [{
@@ -644,6 +701,33 @@ function heldAllocations(store) {
     });
   });
   return out.sort((a, b) => b.start - a.start);
+}
+
+// True while the window is phone-sized (tracks resizes and rotation).
+function useIsPhone() {
+  const get = () => {
+    try {
+      return window.matchMedia(PHONE_QUERY).matches;
+    } catch (e) {
+      return false;
+    }
+  };
+  const [phone, setPhone] = useState(get);
+  useEffect(() => {
+    let mq;
+    try {
+      mq = window.matchMedia(PHONE_QUERY);
+    } catch (e) {
+      return;
+    }
+    const on = () => setPhone(mq.matches);
+    on();
+    if (mq.addEventListener) mq.addEventListener("change", on);else mq.addListener(on);
+    return () => {
+      if (mq.removeEventListener) mq.removeEventListener("change", on);else mq.removeListener(on);
+    };
+  }, []);
+  return phone;
 }
 
 // Dialogs close on Escape (the Android app's back button does this there).
@@ -2007,14 +2091,17 @@ function Toast({
   message,
   note,
   undo,
+  raised,
   onClose
 }) {
+  // On phones it sits above the bottom tabs (and above the + button when that's showing).
+  const bottom = !IS_PHONE ? 28 : raised ? "calc(146px + env(safe-area-inset-bottom))" : "calc(78px + env(safe-area-inset-bottom))";
   return /*#__PURE__*/React.createElement("div", {
     className: "toast",
     style: {
       position: "fixed",
       left: "50%",
-      bottom: 28,
+      bottom,
       transform: "translateX(-50%)",
       zIndex: 90,
       display: "flex",
@@ -2450,6 +2537,1016 @@ function DayGroups({
 }
 
 /* ================= Dashboard ================= */
+/* ================= Phone layout (mirrors the Android app) ================= */
+function StatChip({
+  icon,
+  label,
+  value,
+  color
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1,
+      background: C.cardHi,
+      border: `1px solid ${C.border}`,
+      borderRadius: 14,
+      padding: "12px 14px"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 6,
+      color: C.sub,
+      fontSize: 12,
+      marginBottom: 4
+    }
+  }, icon, label), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 18,
+      fontWeight: 700,
+      color: color || C.text
+    }
+  }, value));
+}
+
+// Horizontally-swipeable ring pager (scroll-snap). One panel → static card; multiple → swipe + dots.
+function SwipeRings({
+  panels,
+  onPageChange
+}) {
+  const [page, setPage] = useState(0);
+  const ref = useRef(null);
+  if (!panels.length) return null;
+  if (panels.length === 1) {
+    return /*#__PURE__*/React.createElement("div", {
+      style: {
+        ...cardStyle,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        paddingTop: 26,
+        paddingBottom: 22
+      }
+    }, panels[0]);
+  }
+  const onScroll = e => {
+    const el = e.target;
+    const p = Math.round(el.scrollLeft / el.clientWidth);
+    if (p !== page && p >= 0 && p < panels.length) {
+      setPage(p);
+      if (onPageChange) onPageChange(p);
+    }
+  };
+  const goto = i => {
+    const el = ref.current;
+    if (el) el.scrollTo({
+      left: i * el.clientWidth,
+      behavior: "smooth"
+    });
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...cardStyle,
+      padding: 0,
+      overflow: "hidden"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    ref: ref,
+    onScroll: onScroll,
+    className: "scroll",
+    style: {
+      display: "flex",
+      overflowX: "auto",
+      scrollSnapType: "x mandatory",
+      WebkitOverflowScrolling: "touch"
+    }
+  }, panels.map((pn, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      flex: "0 0 100%",
+      width: "100%",
+      scrollSnapAlign: "center",
+      display: "flex",
+      flexDirection: "column",
+      alignItems: "center",
+      padding: "26px 12px 6px"
+    }
+  }, pn))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 7,
+      justifyContent: "center",
+      alignItems: "center",
+      padding: "12px 0 16px"
+    }
+  }, panels.map((_, i) => /*#__PURE__*/React.createElement("button", {
+    key: i,
+    onClick: () => goto(i),
+    "aria-label": "Show page " + (i + 1),
+    style: {
+      width: page === i ? 22 : 8,
+      height: 8,
+      borderRadius: 99,
+      border: "none",
+      background: page === i ? C.green : C.border,
+      cursor: "pointer",
+      padding: 0,
+      transition: "all 0.3s ease"
+    }
+  })), /*#__PURE__*/React.createElement("span", {
+    style: {
+      marginLeft: 8,
+      fontSize: 11,
+      color: C.muted,
+      fontWeight: 600
+    }
+  }, "swipe")));
+}
+
+// The Android app's Summary tab: swipeable rings, pace, categories, money flow, balance and gas.
+function PhoneSummary({
+  data,
+  computed,
+  readOnly,
+  addSpendAlloc,
+  updateSpendAlloc,
+  removeSpendAlloc,
+  accounts = []
+}) {
+  const mainName = (accounts.find(a => a.id === PRIMARY_ID) || {}).name;
+  const acctName = id => (accounts.find(a => a.id === id) || {}).name;
+  const {
+    available,
+    afterSavings,
+    afterGas,
+    afterInsurance,
+    afterAlloc,
+    spent,
+    spendingLimit,
+    remainingSpending,
+    gasSpent,
+    gasReimbursed,
+    remainingGas,
+    projectedLeftover,
+    reimbursed,
+    cashOn,
+    cashSpent,
+    cashReimbursed,
+    cashLimitAmt,
+    cashRemaining,
+    cashSetAside,
+    cashStandalone,
+    spendAllocTotal,
+    unallocatedSpending,
+    catSpent,
+    otherSpent,
+    catOver,
+    spillover
+  } = computed;
+  const cl = data.cashLimit || {};
+  const [page, setPage] = useState(0);
+  const [colorFor, setColorFor] = useState(null);
+  const spendAllocs = data.spendingAllocations || [];
+  const overAlloc = unallocatedSpending < -0.004;
+  const overSpend = remainingSpending < 0;
+  const cashOver = cashRemaining < 0;
+  const aboveGoal = projectedLeftover - data.endGoal;
+  // Spending pace — how many days remain and the per-day amount that stays inside the limit.
+  const pace = (() => {
+    const len = data.lengthDays || 14;
+    const start = startOfDay(data.startDate),
+      end = addDays(data.startDate, len),
+      today = startOfDay(Date.now());
+    if (today < start) return {
+      label: "Starts " + fmtMonthDay(start)
+    };
+    if (today >= end) return {
+      label: "Period ended " + fmtMonthDay(end - DAY)
+    };
+    const daysLeft = Math.round((end - today) / DAY);
+    const dayNum = Math.round((today - start) / DAY) + 1;
+    const perDay = Math.max(0, remainingSpending) / daysLeft;
+    const diff = spendingLimit * (dayNum / len) - (spent - reimbursed); // vs an even burn through today
+    const behind = overSpend || diff < 0;
+    const badge = overSpend ? "over budget" : Math.abs(diff) < Math.max(5, spendingLimit * 0.02) ? "on pace" : diff > 0 ? fmt(diff) + " ahead" : fmt(-diff) + " behind";
+    return {
+      label: `${daysLeft} day${daysLeft > 1 ? "s" : ""} left · ${fmt(perDay)}/day is safe`,
+      badge,
+      color: behind ? C.red : C.green,
+      bg: behind ? "rgba(248,113,113,0.12)" : "rgba(52,211,153,0.12)"
+    };
+  })();
+  const nCats = spendAllocs.length;
+  // Category sections for the rings; "Other" = the unallocated part of the limit + untagged purchases.
+  const catSections = spendAllocs.map(a => ({
+    id: a.id,
+    name: a.name || "Category",
+    value: a.amount || 0,
+    spent: catSpent && catSpent[a.id] || 0,
+    color: a.color || C.muted
+  }));
+  const otherBudget = Math.max(0, unallocatedSpending);
+  // Categories that went over spill the extra into Other (see computeStats).
+  const spillFrom = catSections.filter(s => catOver && catOver[s.id]).map(s => ({
+    name: s.name,
+    color: s.color,
+    amount: catOver[s.id]
+  }));
+  const otherSection = {
+    id: "other",
+    name: "Other",
+    value: otherBudget,
+    spent: otherSpent || 0,
+    spill: spillover || 0,
+    color: C.green
+  };
+  const ringCenter = /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.sub,
+      marginBottom: 2
+    }
+  }, "Remaining"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: fmt(remainingSpending).length > 9 ? 25 : 30,
+      fontWeight: 800,
+      color: overSpend ? C.red : C.green,
+      letterSpacing: -0.5
+    }
+  }, fmt(remainingSpending)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: C.muted
+    }
+  }, "of ", fmt(spendingLimit), " limit"));
+  const usdPanel = /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      fontWeight: 700,
+      color: C.green,
+      letterSpacing: 0.6,
+      marginBottom: 10
+    }
+  }, "OVERALL \xB7 USD"), nCats > 0 ? /*#__PURE__*/React.createElement(CategoryRing, {
+    sections: [...catSections, otherSection],
+    size: 184,
+    stroke: 15,
+    onTap: readOnly ? null : setColorFor
+  }, ringCenter) : /*#__PURE__*/React.createElement(Ring, {
+    fraction: (spent - reimbursed) / (spendingLimit || 1),
+    over: overSpend,
+    size: 184,
+    stroke: 15
+  }, ringCenter), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 14,
+      fontSize: 13,
+      color: C.sub
+    }
+  }, "Spent ", /*#__PURE__*/React.createElement("strong", {
+    style: {
+      color: C.text
+    }
+  }, fmt(spent)), reimbursed > 0 && /*#__PURE__*/React.createElement(React.Fragment, null, " \xB7 ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.green
+    }
+  }, "+", fmt(reimbursed), " back")), " ", "of ", fmt(spendingLimit)));
+  const cashPanel = /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      fontWeight: 700,
+      color: C.amber,
+      letterSpacing: 0.6,
+      marginBottom: 10,
+      display: "flex",
+      alignItems: "center",
+      gap: 6
+    }
+  }, /*#__PURE__*/React.createElement(Plane, {
+    size: 13,
+    color: C.amber
+  }), " CASH \xB7 ", cl.code), /*#__PURE__*/React.createElement(Ring, {
+    fraction: (cashSpent - cashReimbursed) / (cashLimitAmt || 1),
+    over: cashOver,
+    tint: C.amber,
+    size: 184,
+    stroke: 15
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.sub,
+      marginBottom: 2
+    }
+  }, "Cash left"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 30,
+      fontWeight: 800,
+      color: cashOver ? C.red : C.amber,
+      letterSpacing: -0.5
+    }
+  }, fmtForeign(cashRemaining, cl.symbol, cl.code)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: C.muted
+    }
+  }, "of ", fmtForeign(cashLimitAmt, cl.symbol, cl.code))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 14,
+      fontSize: 13,
+      color: C.sub
+    }
+  }, "Spent ", /*#__PURE__*/React.createElement("strong", {
+    style: {
+      color: C.text
+    }
+  }, fmtForeign(cashSpent, cl.symbol, cl.code)), cl.rate > 0 && /*#__PURE__*/React.createElement(React.Fragment, null, " \xB7 \u2248 ", fmt(cashRemaining / cl.rate), " left")));
+  const allocPanel = /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      fontWeight: 700,
+      color: C.accent,
+      letterSpacing: 0.6,
+      marginBottom: 10
+    }
+  }, "SPENDING ALLOCATIONS"), /*#__PURE__*/React.createElement(CategoryRing, {
+    sections: [...catSections, {
+      ...otherSection,
+      spent: 0,
+      spill: 0,
+      color: C.border
+    }],
+    size: 184,
+    stroke: 15,
+    onTap: readOnly ? null : setColorFor
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.sub,
+      marginBottom: 2
+    }
+  }, overAlloc ? "Over-allocated" : "Unallocated"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: fmt(Math.abs(unallocatedSpending)).length > 9 ? 23 : 30,
+      fontWeight: 800,
+      color: overAlloc ? C.red : C.text,
+      letterSpacing: -0.5
+    }
+  }, fmt(Math.abs(unallocatedSpending))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: C.muted
+    }
+  }, "of ", fmt(spendingLimit), " limit")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 14,
+      fontSize: 13,
+      color: C.sub
+    }
+  }, nCats ? /*#__PURE__*/React.createElement(React.Fragment, null, nCats, " categor", nCats > 1 ? "ies" : "y", " \xB7 ", /*#__PURE__*/React.createElement("strong", {
+    style: {
+      color: C.text
+    }
+  }, fmt(spendAllocTotal)), " allocated") : "Split your spending money into categories"));
+  const panels = cashStandalone ? [cashPanel] : cashOn ? [usdPanel, cashPanel, allocPanel] : [usdPanel, allocPanel];
+  const onAllocPage = !cashStandalone && page === panels.length - 1;
+  const colorAlloc = colorFor && spendAllocs.find(a => a.id === colorFor);
+  const usedNames = new Set(spendAllocs.map(a => (a.name || "").trim().toLowerCase()));
+  const suggestions = SPEND_SUGGESTIONS.filter(n => !usedNames.has(n.toLowerCase())).slice(0, 4);
+  const allocEditor = /*#__PURE__*/React.createElement("div", {
+    style: cardStyle
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      marginBottom: 4
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13,
+      fontWeight: 600,
+      color: C.sub,
+      letterSpacing: 0.3
+    }
+  }, "SPENDING CATEGORIES"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.sub
+    }
+  }, "Limit ", fmt(spendingLimit))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.muted,
+      lineHeight: 1.45,
+      marginBottom: 6
+    }
+  }, readOnly ? "Monthly view — categories from each pay period, combined. Edit them in a single pay period." : "Split what's left after the Budget tab into categories. Tap a color (here or on the ring) to change it."), spendAllocs.map(a => /*#__PURE__*/React.createElement(SpendAllocRow, {
+    key: a.id,
+    a: a,
+    spent: catSpent && catSpent[a.id] || 0,
+    onUpdate: updateSpendAlloc,
+    onRemove: removeSpendAlloc,
+    onColor: setColorFor,
+    readOnly: readOnly
+  })), !readOnly && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("button", {
+    onClick: () => addSpendAlloc(""),
+    style: {
+      width: "100%",
+      padding: "11px 0",
+      borderRadius: 11,
+      border: `1px dashed ${C.borderHi}`,
+      background: "transparent",
+      color: C.sub,
+      fontSize: 13.5,
+      fontWeight: 600,
+      cursor: "pointer",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      gap: 6,
+      marginTop: 12
+    }
+  }, /*#__PURE__*/React.createElement(Plus, {
+    size: 16
+  }), " Add category"), suggestions.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexWrap: "wrap",
+      gap: 7,
+      justifyContent: "center",
+      marginTop: 10
+    }
+  }, suggestions.map(n => /*#__PURE__*/React.createElement("button", {
+    key: n,
+    onClick: () => addSpendAlloc(n),
+    style: {
+      padding: "6px 11px",
+      borderRadius: 99,
+      border: `1px solid ${C.border}`,
+      background: C.cardHi,
+      color: C.sub,
+      fontSize: 12,
+      fontWeight: 600,
+      cursor: "pointer"
+    }
+  }, "+ ", n)))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 14,
+      background: C.cardHi,
+      borderRadius: 12,
+      padding: "10px 14px"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      fontSize: 13.5,
+      padding: "3px 0"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.sub
+    }
+  }, "Allocated"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontWeight: 600
+    }
+  }, fmt(spendAllocTotal))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      fontSize: 14.5,
+      padding: "3px 0"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.text,
+      fontWeight: 700
+    }
+  }, overAlloc ? "Over by" : "Unallocated"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontWeight: 800,
+      color: overAlloc ? C.red : C.green
+    }
+  }, fmt(Math.abs(unallocatedSpending))))), overAlloc && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 12,
+      display: "flex",
+      gap: 9,
+      alignItems: "flex-start",
+      background: "rgba(248,113,113,0.1)",
+      border: "1px solid rgba(248,113,113,0.3)",
+      borderRadius: 12,
+      padding: "10px 12px"
+    }
+  }, /*#__PURE__*/React.createElement(AlertTriangle, {
+    size: 15,
+    color: C.red,
+    style: {
+      marginTop: 1,
+      flexShrink: 0
+    }
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: C.text,
+      lineHeight: 1.45
+    }
+  }, "Your categories add up to more than your spending limit. Lower a category or free up money on the Budget tab.")));
+  const cashBreakdown = /*#__PURE__*/React.createElement("div", {
+    style: cardStyle
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 8,
+      fontWeight: 600,
+      marginBottom: 12
+    }
+  }, /*#__PURE__*/React.createElement(Plane, {
+    size: 17,
+    color: C.amber
+  }), " ", cl.code, " cash"), [{
+    label: "Withdrawn / allowance",
+    val: fmtForeign(cashLimitAmt, cl.symbol, cl.code)
+  }, {
+    label: "Spent",
+    val: "−" + fmtForeign(cashSpent, cl.symbol, cl.code)
+  }, cashReimbursed > 0 ? {
+    label: "Refunded",
+    val: "+" + fmtForeign(cashReimbursed, cl.symbol, cl.code),
+    pos: true
+  } : null].filter(Boolean).map((r, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      padding: "8px 0",
+      borderBottom: `1px solid ${C.border}`
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 14,
+      color: C.text
+    }
+  }, r.label), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 14,
+      fontWeight: 700,
+      color: r.pos ? C.green : C.text
+    }
+  }, r.val))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      paddingTop: 12
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 15,
+      fontWeight: 700,
+      color: C.text
+    }
+  }, "Left to spend"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 15,
+      fontWeight: 800,
+      color: cashOver ? C.red : C.amber
+    }
+  }, fmtForeign(cashRemaining, cl.symbol, cl.code))), cl.rate > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.muted,
+      marginTop: 10,
+      textAlign: "center"
+    }
+  }, "\u2248 ", fmt(cashRemaining / cl.rate), " left \xB7 1 USD = ", fmtForeign(cl.rate, cl.symbol, cl.code)));
+  const rows = [{
+    label: "Starting Balance",
+    icon: /*#__PURE__*/React.createElement(Banknote, {
+      size: 15
+    }),
+    delta: null,
+    running: data.startingBalance
+  }, {
+    label: "Income",
+    icon: /*#__PURE__*/React.createElement(TrendingUp, {
+      size: 15
+    }),
+    delta: data.totalIncome,
+    running: available,
+    pos: true
+  }, {
+    label: "Savings",
+    icon: /*#__PURE__*/React.createElement(PiggyBank, {
+      size: 15
+    }),
+    delta: -data.savings,
+    running: afterSavings
+  }, {
+    label: "Gas Budget",
+    icon: /*#__PURE__*/React.createElement(Fuel, {
+      size: 15
+    }),
+    delta: -data.gasBudget,
+    running: afterGas
+  }, {
+    label: "Insurance",
+    icon: /*#__PURE__*/React.createElement(Shield, {
+      size: 15
+    }),
+    delta: -data.insurance,
+    running: afterInsurance
+  }];
+  let _run = afterInsurance;
+  (data.allocations || []).forEach(a => {
+    _run -= a.amount || 0;
+    const held = a.accountId && acctName(a.accountId);
+    rows.push({
+      label: a.name || "Allocation",
+      sub: held ? a.paidAt ? "paid " + fmtMonthDay(a.paidAt) : "held in " + held + " until paid" : null,
+      icon: /*#__PURE__*/React.createElement(DollarSign, {
+        size: 15
+      }),
+      delta: -(a.amount || 0),
+      running: _run
+    });
+  });
+  if (cashOn && cashSetAside > 0) {
+    _run -= cashSetAside;
+    rows.push({
+      label: `Travel cash (${fmtForeign(cashLimitAmt, cl.symbol, cl.code)})`,
+      icon: /*#__PURE__*/React.createElement(Plane, {
+        size: 15
+      }),
+      delta: -cashSetAside,
+      running: _run
+    });
+  }
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 16
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      gap: 8,
+      fontSize: 12.5,
+      color: C.sub,
+      marginBottom: -2
+    }
+  }, /*#__PURE__*/React.createElement(CalendarDays, {
+    size: 14,
+    color: C.muted
+  }), /*#__PURE__*/React.createElement("span", null, periodRangeLabel(data), " \xB7 ", data.lengthDays, " days"), data.combined && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10.5,
+      fontWeight: 700,
+      color: C.accent2,
+      background: "rgba(34,211,238,0.14)",
+      padding: "2px 7px",
+      borderRadius: 6,
+      letterSpacing: 0.3
+    }
+  }, "MONTHLY")), /*#__PURE__*/React.createElement(SwipeRings, {
+    panels: panels,
+    onPageChange: setPage
+  }), onAllocPage && allocEditor, !cashStandalone && !onAllocPage && /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 8,
+      background: C.card,
+      border: `1px solid ${C.border}`,
+      borderRadius: 13,
+      padding: "11px 14px",
+      marginTop: -2
+    }
+  }, /*#__PURE__*/React.createElement(Clock, {
+    size: 14,
+    color: C.muted
+  }), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12.5,
+      color: C.sub,
+      flex: 1
+    }
+  }, pace.label), pace.badge && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      fontWeight: 700,
+      color: pace.color,
+      background: pace.bg,
+      padding: "3px 8px",
+      borderRadius: 6,
+      whiteSpace: "nowrap"
+    }
+  }, pace.badge)), cashStandalone && cashBreakdown, !cashStandalone && !onAllocPage && nCats > 0 && /*#__PURE__*/React.createElement("div", {
+    style: cardStyle
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      marginBottom: 2
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13,
+      fontWeight: 600,
+      color: C.sub,
+      letterSpacing: 0.3
+    }
+  }, "CATEGORIES"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.muted
+    }
+  }, "spent of budget")), (() => {
+    const list = [...catSections, ...(otherBudget > 0 || Math.abs(otherSection.spent) > 0.004 || otherSection.spill > 0 ? [otherSection] : [])];
+    return list.map((s, i) => /*#__PURE__*/React.createElement(CatProgress, {
+      key: s.id,
+      color: s.color,
+      name: s.name,
+      spent: s.spent,
+      budget: s.value,
+      last: i === list.length - 1,
+      spillTo: s.id !== "other" ? "Other" : null,
+      spillFrom: s.id === "other" ? spillFrom : []
+    }));
+  })()), !cashStandalone && !onAllocPage && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: cardStyle
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13,
+      fontWeight: 600,
+      color: C.sub,
+      marginBottom: 14,
+      letterSpacing: 0.3
+    }
+  }, "MONEY FLOW"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 2
+    }
+  }, rows.map((r, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      display: "flex",
+      alignItems: "center",
+      padding: "9px 0",
+      borderBottom: i < rows.length - 1 ? `1px solid ${C.border}` : "none"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: C.muted,
+      marginRight: 10,
+      display: "flex"
+    }
+  }, r.icon), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1,
+      minWidth: 0,
+      fontSize: 14,
+      color: C.text
+    }
+  }, r.label, r.sub && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: C.muted,
+      marginTop: 1
+    }
+  }, r.sub)), r.delta != null && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: r.pos ? C.green : C.red,
+      marginRight: 14,
+      minWidth: 78,
+      textAlign: "right"
+    }
+  }, fmtSigned(r.delta)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 15,
+      fontWeight: 700,
+      minWidth: 86,
+      textAlign: "right"
+    }
+  }, fmt(r.running))))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 10,
+      marginTop: 14
+    }
+  }, /*#__PURE__*/React.createElement(StatChip, {
+    icon: /*#__PURE__*/React.createElement(DollarSign, {
+      size: 13
+    }),
+    label: "Spending Limit",
+    value: fmt(spendingLimit),
+    color: C.green
+  }), /*#__PURE__*/React.createElement(StatChip, {
+    icon: /*#__PURE__*/React.createElement(Target, {
+      size: 13
+    }),
+    label: "End Goal",
+    value: fmt(data.endGoal),
+    color: C.amber
+  }))), /*#__PURE__*/React.createElement("div", {
+    style: cardStyle
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      marginBottom: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 8,
+      fontWeight: 600
+    }
+  }, /*#__PURE__*/React.createElement(Wallet, {
+    size: 17,
+    color: C.amber
+  }), " Current Balance", mainName && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12,
+      fontWeight: 500,
+      color: C.muted
+    }
+  }, "\xB7 ", mainName)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.sub
+    }
+  }, "Goal ", fmt(data.endGoal))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 26,
+      fontWeight: 800,
+      color: C.text,
+      marginBottom: 4
+    }
+  }, fmt(computed.currentBalance)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.muted,
+      marginBottom: 12
+    }
+  }, "what's left after savings, insurance, allocations, spending & gas used \u2014 unspent gas budget (", fmt(remainingGas), ") stays in", computed.heldInMain > 0 ? `, and so does ${fmt(computed.heldInMain)} held for bills until you mark them paid` : ""), /*#__PURE__*/React.createElement(Bar, {
+    fraction: data.endGoal ? projectedLeftover / data.endGoal : 0,
+    over: projectedLeftover < data.endGoal
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 10,
+      fontSize: 13,
+      fontWeight: 600,
+      color: aboveGoal >= 0 ? C.green : C.red,
+      display: "flex",
+      alignItems: "center",
+      gap: 6
+    }
+  }, aboveGoal >= 0 ? /*#__PURE__*/React.createElement(Check, {
+    size: 15
+  }) : /*#__PURE__*/React.createElement(X, {
+    size: 15
+  }), aboveGoal >= 0 ? `${fmt(aboveGoal)} of spending room left` : `${fmt(Math.abs(aboveGoal))} below goal`)), /*#__PURE__*/React.createElement("div", {
+    style: cardStyle
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      marginBottom: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 8,
+      fontWeight: 600
+    }
+  }, /*#__PURE__*/React.createElement(Fuel, {
+    size: 17,
+    color: C.accent2
+  }), " Gas"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.sub
+    }
+  }, "Budget ", fmt(data.gasBudget))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "baseline",
+      justifyContent: "space-between",
+      marginBottom: 12
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 22,
+      fontWeight: 800
+    }
+  }, fmt(gasSpent), gasReimbursed > 0 && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 13,
+      fontWeight: 600,
+      color: C.green
+    }
+  }, " \xB7 +", fmt(gasReimbursed), " back")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: remainingGas < 0 ? C.red : C.sub
+    }
+  }, fmt(remainingGas), " left")), /*#__PURE__*/React.createElement(Bar, {
+    fraction: data.gasBudget ? (gasSpent - gasReimbursed) / data.gasBudget : 0,
+    over: remainingGas < 0
+  }))), colorAlloc && /*#__PURE__*/React.createElement(SpendColorModal, {
+    alloc: colorAlloc,
+    others: spendAllocs.filter(a => a.id !== colorAlloc.id),
+    onPick: col => updateSpendAlloc(colorAlloc.id, {
+      color: col
+    }),
+    onClose: () => setColorFor(null)
+  }));
+}
+function PhoneNav({
+  tab,
+  setTab,
+  travelOn
+}) {
+  const items = [{
+    id: "dashboard",
+    label: "Summary",
+    icon: Wallet
+  }, {
+    id: "spending",
+    label: "Spending",
+    icon: Receipt
+  }, travelOn && {
+    id: "convert",
+    label: "Convert",
+    icon: Repeat
+  }, {
+    id: "calendar",
+    label: "Calendar",
+    icon: CalendarDays
+  }, {
+    id: "accounts",
+    label: "Accounts",
+    icon: Bank
+  }, {
+    id: "budget",
+    label: "Budget",
+    icon: Sliders
+  }].filter(Boolean);
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      borderTop: `1px solid ${C.border}`,
+      background: C.chrome,
+      backdropFilter: "blur(12px)",
+      position: "sticky",
+      bottom: 0,
+      paddingBottom: "env(safe-area-inset-bottom)"
+    }
+  }, items.map(it => {
+    const active = tab === it.id;
+    const ItemIcon = it.icon;
+    return /*#__PURE__*/React.createElement("button", {
+      key: it.id,
+      onClick: () => setTab(it.id),
+      style: {
+        flex: 1,
+        padding: "10px 0 12px",
+        border: "none",
+        background: "transparent",
+        cursor: "pointer",
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        gap: 4,
+        color: active ? C.green : C.muted,
+        transition: "color 0.2s"
+      }
+    }, /*#__PURE__*/React.createElement(ItemIcon, {
+      size: 22,
+      strokeWidth: active ? 2.4 : 2
+    }), /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 11,
+        fontWeight: active ? 700 : 500
+      }
+    }, it.label));
+  }));
+}
 function Dashboard({
   data,
   computed,
@@ -3944,7 +5041,71 @@ function AddPurchaseForm({
       fontSize: 12,
       color: remainingSpending < 0 ? C.red : C.muted
     }
-  }, fmt(remainingSpending), " left")), /*#__PURE__*/React.createElement("div", {
+  }, fmt(remainingSpending), " left")), IS_PHONE ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 10,
+      marginBottom: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      background: C.bg2,
+      border: `1px solid ${C.border}`,
+      borderRadius: 11,
+      padding: "0 12px",
+      flex: "0 0 48%",
+      minWidth: 0
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.muted,
+      fontSize: 15,
+      flexShrink: 0
+    }
+  }, currSymbol), /*#__PURE__*/React.createElement("input", {
+    inputMode: "decimal",
+    autoFocus: autoFocus,
+    value: amount,
+    onChange: e => {
+      const v = e.target.value;
+      if (/^\d*\.?\d*$/.test(v)) setAmount(v);
+    },
+    onKeyDown: e => {
+      if (e.key === "Enter") handleAdd();
+    },
+    placeholder: "0.00",
+    style: {
+      background: "transparent",
+      border: "none",
+      outline: "none",
+      color: C.text,
+      fontSize: 17,
+      fontWeight: 600,
+      width: "100%",
+      minWidth: 0,
+      padding: "12px 4px"
+    }
+  })), /*#__PURE__*/React.createElement("input", {
+    value: merchant,
+    onChange: e => setMerchant(e.target.value),
+    onKeyDown: e => {
+      if (e.key === "Enter") handleAdd();
+    },
+    placeholder: "Where?",
+    style: {
+      flex: 1,
+      minWidth: 0,
+      background: C.bg2,
+      border: `1px solid ${C.border}`,
+      borderRadius: 11,
+      outline: "none",
+      color: C.text,
+      fontSize: 15,
+      padding: "12px 14px"
+    }
+  })) : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       alignItems: "center",
@@ -3999,7 +5160,7 @@ function AddPurchaseForm({
       padding: "13px 14px",
       marginBottom: 10
     }
-  }), merchantChips.length > 0 && /*#__PURE__*/React.createElement("div", {
+  })), merchantChips.length > 0 && /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       flexWrap: "wrap",
@@ -4140,20 +5301,19 @@ function QuickAddModal({
   }, []);
   return /*#__PURE__*/React.createElement("div", {
     onClick: onClose,
-    style: {
-      position: "fixed",
-      inset: 0,
-      background: "rgba(0,0,0,0.55)",
-      zIndex: 58,
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
-      padding: 20,
-      animation: "fadeIn 0.2s ease"
-    }
+    style: overlayStyle(58)
   }, /*#__PURE__*/React.createElement("div", {
     onClick: e => e.stopPropagation(),
-    style: {
+    style: IS_PHONE ? {
+      ...panelStyle(460),
+      background: C.bg,
+      padding: "10px 16px 18px",
+      paddingBottom: "calc(18px + env(safe-area-inset-bottom))",
+      maxHeight: "90vh",
+      display: "flex",
+      flexDirection: "column",
+      gap: 12
+    } : {
       width: "100%",
       maxWidth: 460,
       background: C.bg,
@@ -4167,7 +5327,9 @@ function QuickAddModal({
       gap: 14,
       animation: "popIn 0.2s ease"
     }
-  }, /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement(SheetHandle, {
+    mb: 2
+  }), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       alignItems: "center",
@@ -6399,32 +7561,18 @@ function PeriodModal({
   const archiveTarget = archiveId ? store.periods.find(p => p.id === archiveId) : null;
   return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     onClick: onClose,
-    style: {
-      position: "fixed",
-      inset: 0,
-      background: "rgba(0,0,0,0.55)",
-      zIndex: 50,
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
-      padding: 20,
-      animation: "fadeIn 0.2s ease"
-    }
+    style: overlayStyle(50)
   }, /*#__PURE__*/React.createElement("div", {
     onClick: e => e.stopPropagation(),
-    style: {
-      width: "100%",
-      maxWidth: 520,
-      background: C.bg2,
-      border: `1px solid ${C.border}`,
-      borderRadius: 18,
-      padding: 22,
+    style: panelStyle(520, {
       maxHeight: "86vh",
       display: "flex",
       flexDirection: "column",
-      animation: "popIn 0.2s ease"
-    }
-  }, /*#__PURE__*/React.createElement("div", {
+      overflowY: undefined
+    })
+  }, /*#__PURE__*/React.createElement(SheetHandle, {
+    mb: 14
+  }), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       alignItems: "center",
@@ -7108,6 +8256,9 @@ function SettingsModal({
   travel,
   setTravel,
   user,
+  syncState,
+  onSignIn,
+  onSignOut,
   showToast
 }) {
   const [confirmReset, setConfirmReset] = useState(false);
@@ -7152,31 +8303,13 @@ function SettingsModal({
   };
   return /*#__PURE__*/React.createElement("div", {
     onClick: onClose,
-    style: {
-      position: "fixed",
-      inset: 0,
-      background: "rgba(0,0,0,0.55)",
-      zIndex: 55,
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
-      padding: 20,
-      animation: "fadeIn 0.2s ease"
-    }
+    style: overlayStyle(55)
   }, /*#__PURE__*/React.createElement("div", {
     onClick: e => e.stopPropagation(),
-    style: {
-      width: "100%",
-      maxWidth: 520,
-      background: C.bg2,
-      border: `1px solid ${C.border}`,
-      borderRadius: 18,
-      padding: 24,
-      maxHeight: "88vh",
-      overflowY: "auto",
-      animation: "popIn 0.2s ease"
-    }
-  }, /*#__PURE__*/React.createElement("div", {
+    style: panelStyle(520, IS_PHONE ? {} : {
+      padding: 24
+    })
+  }, /*#__PURE__*/React.createElement(SheetHandle, null), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       alignItems: "center",
@@ -7211,7 +8344,126 @@ function SettingsModal({
     }
   }, /*#__PURE__*/React.createElement(X, {
     size: 18
-  }))), /*#__PURE__*/React.createElement("div", {
+  }))), IS_PHONE && onSignIn &&
+  /*#__PURE__*/
+  // Phones have no sidebar, so sign-in lives here (as in the Android app).
+  React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: sectionLabel
+  }, "ACCOUNT & SYNC"), user ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: C.card,
+      border: `1px solid ${C.border}`,
+      borderRadius: 13,
+      padding: 14,
+      display: "flex",
+      alignItems: "center",
+      gap: 12,
+      marginBottom: 22
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 40,
+      height: 40,
+      borderRadius: 99,
+      background: `linear-gradient(135deg, ${C.accent}, ${C.accent2})`,
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      color: "#fff",
+      fontWeight: 700,
+      fontSize: 17,
+      flexShrink: 0
+    }
+  }, (user.name || "U").slice(0, 1).toUpperCase()), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1,
+      minWidth: 0
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 14.5,
+      fontWeight: 600,
+      color: C.text,
+      whiteSpace: "nowrap",
+      overflow: "hidden",
+      textOverflow: "ellipsis"
+    }
+  }, user.name), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.green,
+      display: "flex",
+      alignItems: "center",
+      gap: 5,
+      marginTop: 1
+    }
+  }, /*#__PURE__*/React.createElement(Cloud, {
+    size: 13
+  }), " ", syncState || "Synced")), /*#__PURE__*/React.createElement("button", {
+    onClick: onSignOut,
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 6,
+      padding: "9px 12px",
+      borderRadius: 10,
+      border: `1px solid ${C.border}`,
+      background: "transparent",
+      color: C.sub,
+      fontSize: 13,
+      fontWeight: 600,
+      cursor: "pointer",
+      flexShrink: 0
+    }
+  }, /*#__PURE__*/React.createElement(LogOut, {
+    size: 15
+  }), " Sign out")) : /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: C.card,
+      border: `1px solid ${C.border}`,
+      borderRadius: 13,
+      padding: 16,
+      marginBottom: 22
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: C.muted,
+      display: "flex",
+      alignItems: "center",
+      gap: 6,
+      marginBottom: 12
+    }
+  }, /*#__PURE__*/React.createElement(CloudOff, {
+    size: 14
+  }), " ", syncState === "Offline" ? "Offline — sync needs internet" : "Not signed in · this device only"), /*#__PURE__*/React.createElement("button", {
+    onClick: onSignIn,
+    style: {
+      width: "100%",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      gap: 10,
+      padding: "12px 0",
+      borderRadius: 11,
+      border: `1px solid ${C.border}`,
+      background: C.bg2,
+      color: C.text,
+      fontSize: 14.5,
+      fontWeight: 600,
+      cursor: "pointer"
+    }
+  }, /*#__PURE__*/React.createElement(GoogleG, {
+    size: 18
+  }), " Sign in with Google"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11.5,
+      color: C.muted,
+      marginTop: 10,
+      textAlign: "center",
+      lineHeight: 1.4
+    }
+  }, "Sign in to sync this budget with the Android app and your other devices."))), /*#__PURE__*/React.createElement("div", {
     style: sectionLabel
   }, "APPEARANCE"), /*#__PURE__*/React.createElement("div", {
     style: {
@@ -9652,6 +10904,8 @@ function App() {
   });
   const [toast, setToast] = useState(null);
   const toastTimer = useRef(null);
+  const isPhone = useIsPhone();
+  IS_PHONE = isPhone; // before applyTheme, which rebuilds cardStyle for this layout
   applyTheme(themeMode, resolveAccent(accent.key, accent.custom));
   const showToast = (message, undo, note) => {
     setToast({
@@ -10233,6 +11487,270 @@ function App() {
     budget: "Budget"
   };
   const travelOn = travel.enabled && travel.rate > 0;
+  if (isPhone) {
+    // Same screens as the Android app: header + period picker, Summary, bottom tabs, + button.
+    const showFab = (tab === "dashboard" || tab === "calendar") && singles.length > 0 && !quickAdd;
+    return /*#__PURE__*/React.createElement("div", {
+      style: {
+        minHeight: "100vh",
+        background: C.appBg,
+        display: "flex",
+        justifyContent: "center",
+        color: C.text
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        width: "100%",
+        maxWidth: 440,
+        minHeight: "100vh",
+        background: C.bg,
+        display: "flex",
+        flexDirection: "column",
+        position: "relative",
+        boxShadow: "0 0 60px rgba(0,0,0,0.4)"
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+        padding: "18px 16px 14px",
+        paddingTop: "calc(18px + env(safe-area-inset-top))",
+        borderBottom: `1px solid ${C.border}`,
+        background: C.chrome,
+        backdropFilter: "blur(12px)",
+        WebkitBackdropFilter: "blur(12px)",
+        position: "sticky",
+        top: 0,
+        zIndex: 5
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        width: 38,
+        height: 38,
+        borderRadius: 11,
+        background: `linear-gradient(135deg, ${C.greenDim}, ${C.green})`,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        flexShrink: 0
+      }
+    }, /*#__PURE__*/React.createElement(Wallet, {
+      size: 20,
+      color: "#06281d"
+    })), /*#__PURE__*/React.createElement("button", {
+      onClick: () => setPeriodsOpen(true),
+      style: {
+        flex: 1,
+        minWidth: 0,
+        display: "flex",
+        alignItems: "center",
+        gap: 8,
+        background: "transparent",
+        border: "none",
+        cursor: "pointer",
+        textAlign: "left",
+        padding: 0
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        flex: 1,
+        minWidth: 0
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 16,
+        fontWeight: 700,
+        lineHeight: 1.2,
+        color: C.text
+      }
+    }, "Weekly Budget"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 12,
+        color: C.sub,
+        whiteSpace: "nowrap",
+        overflow: "hidden",
+        textOverflow: "ellipsis"
+      }
+    }, activePeriod.period)), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        alignItems: "center",
+        gap: 4,
+        color: C.sub,
+        background: C.card,
+        border: `1px solid ${C.border}`,
+        borderRadius: 9,
+        padding: "6px 8px",
+        flexShrink: 0
+      }
+    }, /*#__PURE__*/React.createElement(CalendarDays, {
+      size: 15
+    }), /*#__PURE__*/React.createElement(ChevronDown, {
+      size: 15
+    }))), /*#__PURE__*/React.createElement("button", {
+      onClick: () => setSettingsOpen(true),
+      "aria-label": "Settings",
+      style: {
+        width: 38,
+        height: 38,
+        borderRadius: 10,
+        border: `1px solid ${C.border}`,
+        background: C.card,
+        color: C.sub,
+        cursor: "pointer",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        flexShrink: 0
+      }
+    }, /*#__PURE__*/React.createElement(Cog, {
+      size: 18
+    }))), /*#__PURE__*/React.createElement("div", {
+      style: {
+        flex: 1,
+        padding: 16,
+        paddingBottom: showFab ? 88 : 16
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      key: tab + activePeriod.id,
+      style: {
+        animation: "fadeSlide 0.28s ease"
+      }
+    }, tab === "dashboard" && periodEnded && /*#__PURE__*/React.createElement(PeriodEndedCard, {
+      period: activePeriod,
+      carry: carryOver,
+      setCarry: setCarryOver,
+      carryAmount: carryAmount,
+      onStart: () => createPeriod()
+    }), tab === "dashboard" && /*#__PURE__*/React.createElement(PhoneSummary, {
+      data: view,
+      computed: computed,
+      readOnly: readOnly,
+      addSpendAlloc: addSpendAlloc,
+      updateSpendAlloc: updateSpendAlloc,
+      removeSpendAlloc: removeSpendAlloc,
+      accounts: store.accounts
+    }), tab === "spending" && /*#__PURE__*/React.createElement(SpendingView, {
+      data: view,
+      computed: computed,
+      addTransaction: addTransaction,
+      removeTransaction: removeTransaction,
+      updateTransaction: updateTransaction,
+      readOnly: readOnly,
+      travel: travel,
+      store: store
+    }), tab === "convert" && /*#__PURE__*/React.createElement(ConvertView, {
+      computed: computed,
+      travel: travel,
+      setTravel: setTravel,
+      onRefreshRate: () => refreshRate(true)
+    }), tab === "accounts" && /*#__PURE__*/React.createElement(AccountsView, {
+      store: store,
+      onSaveAccount: saveAccount,
+      onDeleteAccount: deleteAccount,
+      onAddBalance: addBalance,
+      onRemoveLog: removeBalanceLog,
+      onMarkPaid: markPaid
+    }), tab === "calendar" && /*#__PURE__*/React.createElement(CalendarView, {
+      data: view,
+      store: store,
+      onUpdateTx: updateTransaction,
+      onRemoveTx: removeTransaction,
+      onAddOnDay: singles.length ? openQuickAdd : null
+    }), tab === "budget" && /*#__PURE__*/React.createElement(BudgetView, {
+      data: view,
+      update: update,
+      clearTransactions: clearTransactions,
+      computed: computed,
+      addAllocation: addAllocation,
+      updateAllocation: updateAllocation,
+      removeAllocation: removeAllocation,
+      readOnly: readOnly,
+      travel: travel,
+      recurring: store.recurring,
+      addRecurring: addRecurring,
+      updateRecurring: updateRecurring,
+      removeRecurring: removeRecurring,
+      applyRecurring: applyRecurring,
+      addSpendAlloc: addSpendAlloc,
+      updateSpendAlloc: updateSpendAlloc,
+      removeSpendAlloc: removeSpendAlloc,
+      accounts: store.accounts,
+      onAllocPaid: (aid, at) => markPaid(activePeriod.id, aid, at, ((activePeriod.allocations || []).find(a => a.id === aid) || {}).name)
+    }))), showFab && /*#__PURE__*/React.createElement("button", {
+      onClick: () => openQuickAdd(),
+      "aria-label": "Add purchase",
+      style: {
+        position: "fixed",
+        right: "max(16px, calc((100vw - 440px) / 2 + 16px))",
+        bottom: "calc(78px + env(safe-area-inset-bottom))",
+        zIndex: 20,
+        width: 56,
+        height: 56,
+        borderRadius: 18,
+        border: "none",
+        background: `linear-gradient(135deg, ${C.greenDim}, ${C.green})`,
+        color: "#06281d",
+        boxShadow: "0 8px 24px rgba(0,0,0,0.35)",
+        cursor: "pointer",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center"
+      }
+    }, /*#__PURE__*/React.createElement(Plus, {
+      size: 26,
+      strokeWidth: 2.6
+    })), /*#__PURE__*/React.createElement(PhoneNav, {
+      tab: tab,
+      setTab: setTab,
+      travelOn: travel && travel.enabled
+    })), periodsOpen && /*#__PURE__*/React.createElement(PeriodModal, {
+      store: store,
+      onClose: () => setPeriodsOpen(false),
+      onSwitch: switchPeriod,
+      onCreate: () => createPeriod(),
+      onDelete: deletePeriod,
+      onCombine: combinePeriods,
+      onArchive: archivePeriod,
+      carry: carryOver,
+      setCarry: setCarryOver,
+      carryAmount: carryAmount
+    }), quickPeriod && /*#__PURE__*/React.createElement(QuickAddModal, {
+      key: quickAdd.pid + (quickAdd.day || ""),
+      period: quickPeriod,
+      store: store,
+      travel: travel,
+      addTransaction: t => addTransaction(t, quickAdd.pid),
+      presetDay: quickAdd.day,
+      isActive: quickAdd.pid === activePeriod.id,
+      onClose: () => setQuickAdd(null)
+    }), settingsOpen && /*#__PURE__*/React.createElement(SettingsModal, {
+      themeMode: themeMode,
+      setThemeMode: setThemeMode,
+      accent: accent,
+      setAccent: setAccent,
+      store: store,
+      onReset: resetAllData,
+      onRestore: restoreData,
+      onClose: () => setSettingsOpen(false),
+      travel: travel,
+      setTravel: setTravel,
+      user: user,
+      syncState: syncState,
+      onSignIn: signIn,
+      onSignOut: signOut,
+      showToast: showToast
+    }), toast && /*#__PURE__*/React.createElement(Toast, {
+      message: toast.message,
+      note: toast.note,
+      undo: toast.undo,
+      raised: showFab,
+      onClose: () => setToast(null)
+    }), showOnboarding && /*#__PURE__*/React.createElement(Onboarding, {
+      onDone: finishOnboarding
+    }));
+  }
   return /*#__PURE__*/React.createElement("div", {
     className: "shell"
   }, /*#__PURE__*/React.createElement(Sidebar, {

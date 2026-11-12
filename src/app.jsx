@@ -69,8 +69,24 @@
       light: { appBg:"#e7e9ee", chrome:"rgba(255,255,255,0.85)", bg:"#f4f5f8", bg2:"#ffffff", card:"#ffffff", cardHi:"#f1f3f6", border:"#e2e6ec", borderHi:"#d2d8e0", text:"#1a1d23", sub:"#5b6573", muted:"#98a1b0", green:"#059669", greenDim:"#10b981", red:"#dc2626", amber:"#d97706", accent:"#6366f1", accent2:"#0891b2" },
     };
     let C = THEMES.dark;
-    const mkCard = () => ({ background: C.card, border: `1px solid ${C.border}`, borderRadius: 16, padding: 20 });
+    // Phone-sized windows get the Android app's layout (header, bottom tabs, bottom sheets).
+    // Set by App on every render, before anything below it reads cardStyle.
+    const PHONE_QUERY = "(max-width: 860px)";
+    let IS_PHONE = false;
+    const mkCard = () => (IS_PHONE
+      ? { background: C.card, border: `1px solid ${C.border}`, borderRadius: 18, padding: 18 }
+      : { background: C.card, border: `1px solid ${C.border}`, borderRadius: 16, padding: 20 });
     let cardStyle = mkCard();
+    // Overlay + panel styles for dialogs: a centered card on desktop, a bottom sheet on phones.
+    const overlayStyle = (zIndex, dim = 0.55) => ({ position: "fixed", inset: 0, background: `rgba(0,0,0,${dim})`, zIndex, display: "flex",
+      alignItems: IS_PHONE ? "flex-end" : "center", justifyContent: "center", padding: IS_PHONE ? 0 : 20, animation: "fadeIn 0.2s ease" });
+    const panelStyle = (maxWidth, extra = {}) => (IS_PHONE
+      ? { width: "100%", maxWidth: 440, background: C.bg2, borderTopLeftRadius: 22, borderTopRightRadius: 22, borderTop: `1px solid ${C.border}`,
+          padding: "10px 18px 18px", paddingBottom: "calc(18px + env(safe-area-inset-bottom))", maxHeight: "86vh", overflowY: "auto",
+          animation: "sheetUp 0.28s cubic-bezier(0.22,1,0.36,1)", ...extra }
+      : { width: "100%", maxWidth, background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 18, padding: 22, maxHeight: "88vh",
+          overflowY: "auto", animation: "popIn 0.2s ease", ...extra });
+    const SheetHandle = ({ mb = 16 }) => IS_PHONE ? <div style={{ width: 38, height: 4, borderRadius: 99, background: C.borderHi, margin: `6px auto ${mb}px` }} /> : null;
 
     // Accent (brand) colors — override the default emerald. "green" keeps each theme's tuned default.
     const ACCENTS = [
@@ -297,6 +313,20 @@
         (b.allocations || []).forEach((a) => { if (a.accountId && ids.has(a.accountId) && (a.amount || 0) > 0) out.push({ pid: p.id, period: p.period, start: p.startDate, alloc: a }); });
       });
       return out.sort((a, b) => b.start - a.start);
+    }
+
+    // True while the window is phone-sized (tracks resizes and rotation).
+    function useIsPhone() {
+      const get = () => { try { return window.matchMedia(PHONE_QUERY).matches; } catch (e) { return false; } };
+      const [phone, setPhone] = useState(get);
+      useEffect(() => {
+        let mq; try { mq = window.matchMedia(PHONE_QUERY); } catch (e) { return; }
+        const on = () => setPhone(mq.matches);
+        on();
+        if (mq.addEventListener) mq.addEventListener("change", on); else mq.addListener(on);
+        return () => { if (mq.removeEventListener) mq.removeEventListener("change", on); else mq.removeListener(on); };
+      }, []);
+      return phone;
     }
 
     // Dialogs close on Escape (the Android app's back button does this there).
@@ -787,9 +817,11 @@
         </div>
       );
     }
-    function Toast({ message, note, undo, onClose }) {
+    function Toast({ message, note, undo, raised, onClose }) {
+      // On phones it sits above the bottom tabs (and above the + button when that's showing).
+      const bottom = !IS_PHONE ? 28 : raised ? "calc(146px + env(safe-area-inset-bottom))" : "calc(78px + env(safe-area-inset-bottom))";
       return (
-        <div className="toast" style={{ position:"fixed", left:"50%", bottom:28, transform:"translateX(-50%)", zIndex:90, display:"flex", alignItems:"center", gap:14, background:C.cardHi, border:`1px solid ${C.borderHi}`, borderRadius:12, padding:"12px 16px", boxShadow:"0 10px 30px rgba(0,0,0,0.45)", animation:"toastIn 0.25s cubic-bezier(0.22,1,0.36,1)", maxWidth:"calc(100% - 32px)" }}>
+        <div className="toast" style={{ position:"fixed", left:"50%", bottom, transform:"translateX(-50%)", zIndex:90, display:"flex", alignItems:"center", gap:14, background:C.cardHi, border:`1px solid ${C.borderHi}`, borderRadius:12, padding:"12px 16px", boxShadow:"0 10px 30px rgba(0,0,0,0.45)", animation:"toastIn 0.25s cubic-bezier(0.22,1,0.36,1)", maxWidth:"calc(100% - 32px)" }}>
           <div style={{ minWidth:0 }}>
             <div style={{ fontSize:13.5, color:C.text, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{message}</div>
             {note && <div style={{ fontSize:12, color:C.red, marginTop:2, lineHeight:1.35 }}>{note}</div>}
@@ -893,6 +925,315 @@
     }
 
     /* ================= Dashboard ================= */
+    /* ================= Phone layout (mirrors the Android app) ================= */
+    function StatChip({ icon, label, value, color }) {
+      return (
+        <div style={{ flex: 1, background: C.cardHi, border: `1px solid ${C.border}`, borderRadius: 14, padding: "12px 14px" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, color: C.sub, fontSize: 12, marginBottom: 4 }}>{icon}{label}</div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: color || C.text }}>{value}</div>
+        </div>
+      );
+    }
+
+    // Horizontally-swipeable ring pager (scroll-snap). One panel → static card; multiple → swipe + dots.
+    function SwipeRings({ panels, onPageChange }) {
+      const [page, setPage] = useState(0);
+      const ref = useRef(null);
+      if (!panels.length) return null;
+      if (panels.length === 1) {
+        return <div style={{ ...cardStyle, display: "flex", flexDirection: "column", alignItems: "center", paddingTop: 26, paddingBottom: 22 }}>{panels[0]}</div>;
+      }
+      const onScroll = (e) => { const el = e.target; const p = Math.round(el.scrollLeft / el.clientWidth); if (p !== page && p >= 0 && p < panels.length) { setPage(p); if (onPageChange) onPageChange(p); } };
+      const goto = (i) => { const el = ref.current; if (el) el.scrollTo({ left: i * el.clientWidth, behavior: "smooth" }); };
+      return (
+        <div style={{ ...cardStyle, padding: 0, overflow: "hidden" }}>
+          <div ref={ref} onScroll={onScroll} className="scroll" style={{ display: "flex", overflowX: "auto", scrollSnapType: "x mandatory", WebkitOverflowScrolling: "touch" }}>
+            {panels.map((pn, i) => (
+              <div key={i} style={{ flex: "0 0 100%", width: "100%", scrollSnapAlign: "center", display: "flex", flexDirection: "column", alignItems: "center", padding: "26px 12px 6px" }}>{pn}</div>
+            ))}
+          </div>
+          <div style={{ display: "flex", gap: 7, justifyContent: "center", alignItems: "center", padding: "12px 0 16px" }}>
+            {panels.map((_, i) => (
+              <button key={i} onClick={() => goto(i)} aria-label={"Show page " + (i + 1)} style={{ width: page === i ? 22 : 8, height: 8, borderRadius: 99, border: "none", background: page === i ? C.green : C.border, cursor: "pointer", padding: 0, transition: "all 0.3s ease" }} />
+            ))}
+            <span style={{ marginLeft: 8, fontSize: 11, color: C.muted, fontWeight: 600 }}>swipe</span>
+          </div>
+        </div>
+      );
+    }
+
+    // The Android app's Summary tab: swipeable rings, pace, categories, money flow, balance and gas.
+    function PhoneSummary({ data, computed, readOnly, addSpendAlloc, updateSpendAlloc, removeSpendAlloc, accounts = [] }) {
+      const mainName = (accounts.find((a) => a.id === PRIMARY_ID) || {}).name;
+      const acctName = (id) => (accounts.find((a) => a.id === id) || {}).name;
+      const { available, afterSavings, afterGas, afterInsurance, afterAlloc, spent, spendingLimit, remainingSpending, gasSpent, gasReimbursed, remainingGas, projectedLeftover, reimbursed,
+        cashOn, cashSpent, cashReimbursed, cashLimitAmt, cashRemaining, cashSetAside, cashStandalone, spendAllocTotal, unallocatedSpending, catSpent, otherSpent, catOver, spillover } = computed;
+      const cl = data.cashLimit || {};
+      const [page, setPage] = useState(0);
+      const [colorFor, setColorFor] = useState(null);
+      const spendAllocs = data.spendingAllocations || [];
+      const overAlloc = unallocatedSpending < -0.004;
+      const overSpend = remainingSpending < 0;
+      const cashOver = cashRemaining < 0;
+      const aboveGoal = projectedLeftover - data.endGoal;
+      // Spending pace — how many days remain and the per-day amount that stays inside the limit.
+      const pace = (() => {
+        const len = data.lengthDays || 14;
+        const start = startOfDay(data.startDate), end = addDays(data.startDate, len), today = startOfDay(Date.now());
+        if (today < start) return { label: "Starts " + fmtMonthDay(start) };
+        if (today >= end) return { label: "Period ended " + fmtMonthDay(end - DAY) };
+        const daysLeft = Math.round((end - today) / DAY);
+        const dayNum = Math.round((today - start) / DAY) + 1;
+        const perDay = Math.max(0, remainingSpending) / daysLeft;
+        const diff = spendingLimit * (dayNum / len) - (spent - reimbursed); // vs an even burn through today
+        const behind = overSpend || diff < 0;
+        const badge = overSpend ? "over budget" : Math.abs(diff) < Math.max(5, spendingLimit * 0.02) ? "on pace" : diff > 0 ? fmt(diff) + " ahead" : fmt(-diff) + " behind";
+        return { label: `${daysLeft} day${daysLeft > 1 ? "s" : ""} left · ${fmt(perDay)}/day is safe`, badge,
+          color: behind ? C.red : C.green, bg: behind ? "rgba(248,113,113,0.12)" : "rgba(52,211,153,0.12)" };
+      })();
+      const nCats = spendAllocs.length;
+      // Category sections for the rings; "Other" = the unallocated part of the limit + untagged purchases.
+      const catSections = spendAllocs.map((a) => ({ id: a.id, name: a.name || "Category", value: a.amount || 0, spent: (catSpent && catSpent[a.id]) || 0, color: a.color || C.muted }));
+      const otherBudget = Math.max(0, unallocatedSpending);
+      // Categories that went over spill the extra into Other (see computeStats).
+      const spillFrom = catSections.filter((s) => catOver && catOver[s.id]).map((s) => ({ name: s.name, color: s.color, amount: catOver[s.id] }));
+      const otherSection = { id: "other", name: "Other", value: otherBudget, spent: otherSpent || 0, spill: spillover || 0, color: C.green };
+      const ringCenter = (
+        <React.Fragment>
+          <div style={{ fontSize: 12, color: C.sub, marginBottom: 2 }}>Remaining</div>
+          <div style={{ fontSize: fmt(remainingSpending).length > 9 ? 25 : 30, fontWeight: 800, color: overSpend ? C.red : C.green, letterSpacing: -0.5 }}>{fmt(remainingSpending)}</div>
+          <div style={{ fontSize: 11, color: C.muted }}>of {fmt(spendingLimit)} limit</div>
+        </React.Fragment>
+      );
+      const usdPanel = (
+        <React.Fragment>
+          <div style={{ fontSize: 11, fontWeight: 700, color: C.green, letterSpacing: 0.6, marginBottom: 10 }}>OVERALL · USD</div>
+          {nCats > 0
+            ? <CategoryRing sections={[...catSections, otherSection]} size={184} stroke={15} onTap={readOnly ? null : setColorFor}>{ringCenter}</CategoryRing>
+            : <Ring fraction={(spent - reimbursed) / (spendingLimit || 1)} over={overSpend} size={184} stroke={15}>{ringCenter}</Ring>}
+          <div style={{ marginTop: 14, fontSize: 13, color: C.sub }}>
+            Spent <strong style={{ color: C.text }}>{fmt(spent)}</strong>
+            {reimbursed > 0 && <React.Fragment> · <span style={{ color: C.green }}>+{fmt(reimbursed)} back</span></React.Fragment>}
+            {" "}of {fmt(spendingLimit)}
+          </div>
+        </React.Fragment>
+      );
+      const cashPanel = (
+        <React.Fragment>
+          <div style={{ fontSize: 11, fontWeight: 700, color: C.amber, letterSpacing: 0.6, marginBottom: 10, display: "flex", alignItems: "center", gap: 6 }}><Plane size={13} color={C.amber} /> CASH · {cl.code}</div>
+          <Ring fraction={(cashSpent - cashReimbursed) / (cashLimitAmt || 1)} over={cashOver} tint={C.amber} size={184} stroke={15}>
+            <div style={{ fontSize: 12, color: C.sub, marginBottom: 2 }}>Cash left</div>
+            <div style={{ fontSize: 30, fontWeight: 800, color: cashOver ? C.red : C.amber, letterSpacing: -0.5 }}>{fmtForeign(cashRemaining, cl.symbol, cl.code)}</div>
+            <div style={{ fontSize: 11, color: C.muted }}>of {fmtForeign(cashLimitAmt, cl.symbol, cl.code)}</div>
+          </Ring>
+          <div style={{ marginTop: 14, fontSize: 13, color: C.sub }}>
+            Spent <strong style={{ color: C.text }}>{fmtForeign(cashSpent, cl.symbol, cl.code)}</strong>
+            {cl.rate > 0 && <React.Fragment> · ≈ {fmt(cashRemaining / cl.rate)} left</React.Fragment>}
+          </div>
+        </React.Fragment>
+      );
+      const allocPanel = (
+        <React.Fragment>
+          <div style={{ fontSize: 11, fontWeight: 700, color: C.accent, letterSpacing: 0.6, marginBottom: 10 }}>SPENDING ALLOCATIONS</div>
+          <CategoryRing sections={[...catSections, { ...otherSection, spent: 0, spill: 0, color: C.border }]} size={184} stroke={15} onTap={readOnly ? null : setColorFor}>
+            <div style={{ fontSize: 12, color: C.sub, marginBottom: 2 }}>{overAlloc ? "Over-allocated" : "Unallocated"}</div>
+            <div style={{ fontSize: fmt(Math.abs(unallocatedSpending)).length > 9 ? 23 : 30, fontWeight: 800, color: overAlloc ? C.red : C.text, letterSpacing: -0.5 }}>{fmt(Math.abs(unallocatedSpending))}</div>
+            <div style={{ fontSize: 11, color: C.muted }}>of {fmt(spendingLimit)} limit</div>
+          </CategoryRing>
+          <div style={{ marginTop: 14, fontSize: 13, color: C.sub }}>
+            {nCats ? <React.Fragment>{nCats} categor{nCats > 1 ? "ies" : "y"} · <strong style={{ color: C.text }}>{fmt(spendAllocTotal)}</strong> allocated</React.Fragment> : "Split your spending money into categories"}
+          </div>
+        </React.Fragment>
+      );
+      const panels = cashStandalone ? [cashPanel] : (cashOn ? [usdPanel, cashPanel, allocPanel] : [usdPanel, allocPanel]);
+      const onAllocPage = !cashStandalone && page === panels.length - 1;
+      const colorAlloc = colorFor && spendAllocs.find((a) => a.id === colorFor);
+      const usedNames = new Set(spendAllocs.map((a) => (a.name || "").trim().toLowerCase()));
+      const suggestions = SPEND_SUGGESTIONS.filter((n) => !usedNames.has(n.toLowerCase())).slice(0, 4);
+      const allocEditor = (
+        <div style={cardStyle}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+            <div style={{ fontSize: 13, fontWeight: 600, color: C.sub, letterSpacing: 0.3 }}>SPENDING CATEGORIES</div>
+            <div style={{ fontSize: 12, color: C.sub }}>Limit {fmt(spendingLimit)}</div>
+          </div>
+          <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.45, marginBottom: 6 }}>
+            {readOnly ? "Monthly view — categories from each pay period, combined. Edit them in a single pay period." : "Split what's left after the Budget tab into categories. Tap a color (here or on the ring) to change it."}
+          </div>
+          {spendAllocs.map((a) => <SpendAllocRow key={a.id} a={a} spent={(catSpent && catSpent[a.id]) || 0} onUpdate={updateSpendAlloc} onRemove={removeSpendAlloc} onColor={setColorFor} readOnly={readOnly} />)}
+          {!readOnly && (
+            <React.Fragment>
+              <button onClick={() => addSpendAlloc("")} style={{ width: "100%", padding: "11px 0", borderRadius: 11, border: `1px dashed ${C.borderHi}`, background: "transparent", color: C.sub, fontSize: 13.5, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6, marginTop: 12 }}>
+                <Plus size={16} /> Add category
+              </button>
+              {suggestions.length > 0 && (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 7, justifyContent: "center", marginTop: 10 }}>
+                  {suggestions.map((n) => (
+                    <button key={n} onClick={() => addSpendAlloc(n)} style={{ padding: "6px 11px", borderRadius: 99, border: `1px solid ${C.border}`, background: C.cardHi, color: C.sub, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>+ {n}</button>
+                  ))}
+                </div>
+              )}
+            </React.Fragment>
+          )}
+          <div style={{ marginTop: 14, background: C.cardHi, borderRadius: 12, padding: "10px 14px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13.5, padding: "3px 0" }}><span style={{ color: C.sub }}>Allocated</span><span style={{ fontWeight: 600 }}>{fmt(spendAllocTotal)}</span></div>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 14.5, padding: "3px 0" }}>
+              <span style={{ color: C.text, fontWeight: 700 }}>{overAlloc ? "Over by" : "Unallocated"}</span>
+              <span style={{ fontWeight: 800, color: overAlloc ? C.red : C.green }}>{fmt(Math.abs(unallocatedSpending))}</span>
+            </div>
+          </div>
+          {overAlloc && (
+            <div style={{ marginTop: 12, display: "flex", gap: 9, alignItems: "flex-start", background: "rgba(248,113,113,0.1)", border: "1px solid rgba(248,113,113,0.3)", borderRadius: 12, padding: "10px 12px" }}>
+              <AlertTriangle size={15} color={C.red} style={{ marginTop: 1, flexShrink: 0 }} />
+              <div style={{ fontSize: 12.5, color: C.text, lineHeight: 1.45 }}>Your categories add up to more than your spending limit. Lower a category or free up money on the Budget tab.</div>
+            </div>
+          )}
+        </div>
+      );
+      const cashBreakdown = (
+        <div style={cardStyle}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 600, marginBottom: 12 }}><Plane size={17} color={C.amber} /> {cl.code} cash</div>
+          {[
+            { label: "Withdrawn / allowance", val: fmtForeign(cashLimitAmt, cl.symbol, cl.code) },
+            { label: "Spent", val: "−" + fmtForeign(cashSpent, cl.symbol, cl.code) },
+            cashReimbursed > 0 ? { label: "Refunded", val: "+" + fmtForeign(cashReimbursed, cl.symbol, cl.code), pos: true } : null,
+          ].filter(Boolean).map((r, i) => (
+            <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "8px 0", borderBottom: `1px solid ${C.border}` }}>
+              <span style={{ fontSize: 14, color: C.text }}>{r.label}</span>
+              <span style={{ fontSize: 14, fontWeight: 700, color: r.pos ? C.green : C.text }}>{r.val}</span>
+            </div>
+          ))}
+          <div style={{ display: "flex", justifyContent: "space-between", paddingTop: 12 }}>
+            <span style={{ fontSize: 15, fontWeight: 700, color: C.text }}>Left to spend</span>
+            <span style={{ fontSize: 15, fontWeight: 800, color: cashOver ? C.red : C.amber }}>{fmtForeign(cashRemaining, cl.symbol, cl.code)}</span>
+          </div>
+          {cl.rate > 0 && <div style={{ fontSize: 12, color: C.muted, marginTop: 10, textAlign: "center" }}>≈ {fmt(cashRemaining / cl.rate)} left · 1 USD = {fmtForeign(cl.rate, cl.symbol, cl.code)}</div>}
+        </div>
+      );
+      const rows = [
+        { label: "Starting Balance", icon: <Banknote size={15} />, delta: null, running: data.startingBalance },
+        { label: "Income", icon: <TrendingUp size={15} />, delta: data.totalIncome, running: available, pos: true },
+        { label: "Savings", icon: <PiggyBank size={15} />, delta: -data.savings, running: afterSavings },
+        { label: "Gas Budget", icon: <Fuel size={15} />, delta: -data.gasBudget, running: afterGas },
+        { label: "Insurance", icon: <Shield size={15} />, delta: -data.insurance, running: afterInsurance },
+      ];
+      let _run = afterInsurance;
+      (data.allocations || []).forEach((a) => {
+        _run -= (a.amount || 0);
+        const held = a.accountId && acctName(a.accountId);
+        rows.push({ label: a.name || "Allocation", sub: held ? (a.paidAt ? "paid " + fmtMonthDay(a.paidAt) : "held in " + held + " until paid") : null, icon: <DollarSign size={15} />, delta: -(a.amount || 0), running: _run });
+      });
+      if (cashOn && cashSetAside > 0) { _run -= cashSetAside; rows.push({ label: `Travel cash (${fmtForeign(cashLimitAmt, cl.symbol, cl.code)})`, icon: <Plane size={15} />, delta: -cashSetAside, running: _run }); }
+      return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, fontSize: 12.5, color: C.sub, marginBottom: -2 }}>
+            <CalendarDays size={14} color={C.muted} />
+            <span>{periodRangeLabel(data)} · {data.lengthDays} days</span>
+            {data.combined && <span style={{ fontSize: 10.5, fontWeight: 700, color: C.accent2, background: "rgba(34,211,238,0.14)", padding: "2px 7px", borderRadius: 6, letterSpacing: 0.3 }}>MONTHLY</span>}
+          </div>
+          <SwipeRings panels={panels} onPageChange={setPage} />
+
+          {onAllocPage && allocEditor}
+
+          {!cashStandalone && !onAllocPage && (
+            <div style={{ display: "flex", alignItems: "center", gap: 8, background: C.card, border: `1px solid ${C.border}`, borderRadius: 13, padding: "11px 14px", marginTop: -2 }}>
+              <Clock size={14} color={C.muted} />
+              <span style={{ fontSize: 12.5, color: C.sub, flex: 1 }}>{pace.label}</span>
+              {pace.badge && <span style={{ fontSize: 11, fontWeight: 700, color: pace.color, background: pace.bg, padding: "3px 8px", borderRadius: 6, whiteSpace: "nowrap" }}>{pace.badge}</span>}
+            </div>
+          )}
+
+          {cashStandalone && cashBreakdown}
+
+          {!cashStandalone && !onAllocPage && nCats > 0 && (
+            <div style={cardStyle}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 2 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: C.sub, letterSpacing: 0.3 }}>CATEGORIES</div>
+                <div style={{ fontSize: 12, color: C.muted }}>spent of budget</div>
+              </div>
+              {(() => {
+                const list = [...catSections, ...((otherBudget > 0 || Math.abs(otherSection.spent) > 0.004 || otherSection.spill > 0) ? [otherSection] : [])];
+                return list.map((s, i) => <CatProgress key={s.id} color={s.color} name={s.name} spent={s.spent} budget={s.value} last={i === list.length - 1}
+                  spillTo={s.id !== "other" ? "Other" : null} spillFrom={s.id === "other" ? spillFrom : []} />);
+              })()}
+            </div>
+          )}
+
+          {!cashStandalone && !onAllocPage && <React.Fragment>
+          <div style={cardStyle}>
+            <div style={{ fontSize: 13, fontWeight: 600, color: C.sub, marginBottom: 14, letterSpacing: 0.3 }}>MONEY FLOW</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+              {rows.map((r, i) => (
+                <div key={i} style={{ display: "flex", alignItems: "center", padding: "9px 0", borderBottom: i < rows.length - 1 ? `1px solid ${C.border}` : "none" }}>
+                  <div style={{ color: C.muted, marginRight: 10, display: "flex" }}>{r.icon}</div>
+                  <div style={{ flex: 1, minWidth: 0, fontSize: 14, color: C.text }}>{r.label}{r.sub && <div style={{ fontSize: 11, color: C.muted, marginTop: 1 }}>{r.sub}</div>}</div>
+                  {r.delta != null && <div style={{ fontSize: 13, color: r.pos ? C.green : C.red, marginRight: 14, minWidth: 78, textAlign: "right" }}>{fmtSigned(r.delta)}</div>}
+                  <div style={{ fontSize: 15, fontWeight: 700, minWidth: 86, textAlign: "right" }}>{fmt(r.running)}</div>
+                </div>
+              ))}
+            </div>
+            <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
+              <StatChip icon={<DollarSign size={13} />} label="Spending Limit" value={fmt(spendingLimit)} color={C.green} />
+              <StatChip icon={<Target size={13} />} label="End Goal" value={fmt(data.endGoal)} color={C.amber} />
+            </div>
+          </div>
+
+          <div style={cardStyle}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 600 }}><Wallet size={17} color={C.amber} /> Current Balance{mainName && <span style={{ fontSize: 12, fontWeight: 500, color: C.muted }}>· {mainName}</span>}</div>
+              <div style={{ fontSize: 12, color: C.sub }}>Goal {fmt(data.endGoal)}</div>
+            </div>
+            <div style={{ fontSize: 26, fontWeight: 800, color: C.text, marginBottom: 4 }}>{fmt(computed.currentBalance)}</div>
+            <div style={{ fontSize: 12, color: C.muted, marginBottom: 12 }}>what's left after savings, insurance, allocations, spending &amp; gas used — unspent gas budget ({fmt(remainingGas)}) stays in{computed.heldInMain > 0 ? `, and so does ${fmt(computed.heldInMain)} held for bills until you mark them paid` : ""}</div>
+            <Bar fraction={data.endGoal ? projectedLeftover / data.endGoal : 0} over={projectedLeftover < data.endGoal} />
+            <div style={{ marginTop: 10, fontSize: 13, fontWeight: 600, color: aboveGoal >= 0 ? C.green : C.red, display: "flex", alignItems: "center", gap: 6 }}>
+              {aboveGoal >= 0 ? <Check size={15} /> : <X size={15} />}
+              {aboveGoal >= 0 ? `${fmt(aboveGoal)} of spending room left` : `${fmt(Math.abs(aboveGoal))} below goal`}
+            </div>
+          </div>
+
+          <div style={cardStyle}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 600 }}><Fuel size={17} color={C.accent2} /> Gas</div>
+              <div style={{ fontSize: 12, color: C.sub }}>Budget {fmt(data.gasBudget)}</div>
+            </div>
+            <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 12 }}>
+              <div style={{ fontSize: 22, fontWeight: 800 }}>{fmt(gasSpent)}{gasReimbursed > 0 && <span style={{ fontSize: 13, fontWeight: 600, color: C.green }}> · +{fmt(gasReimbursed)} back</span>}</div>
+              <div style={{ fontSize: 13, color: remainingGas < 0 ? C.red : C.sub }}>{fmt(remainingGas)} left</div>
+            </div>
+            <Bar fraction={data.gasBudget ? (gasSpent - gasReimbursed) / data.gasBudget : 0} over={remainingGas < 0} />
+          </div>
+          </React.Fragment>}
+
+          {colorAlloc && <SpendColorModal alloc={colorAlloc} others={spendAllocs.filter((a) => a.id !== colorAlloc.id)} onPick={(col) => updateSpendAlloc(colorAlloc.id, { color: col })} onClose={() => setColorFor(null)} />}
+        </div>
+      );
+    }
+
+    function PhoneNav({ tab, setTab, travelOn }) {
+      const items = [
+        { id: "dashboard", label: "Summary", icon: Wallet },
+        { id: "spending", label: "Spending", icon: Receipt },
+        travelOn && { id: "convert", label: "Convert", icon: Repeat },
+        { id: "calendar", label: "Calendar", icon: CalendarDays },
+        { id: "accounts", label: "Accounts", icon: Bank },
+        { id: "budget", label: "Budget", icon: Sliders },
+      ].filter(Boolean);
+      return (
+        <div style={{ display: "flex", borderTop: `1px solid ${C.border}`, background: C.chrome, backdropFilter: "blur(12px)", position: "sticky", bottom: 0, paddingBottom: "env(safe-area-inset-bottom)" }}>
+          {items.map((it) => {
+            const active = tab === it.id;
+            const ItemIcon = it.icon;
+            return (
+              <button key={it.id} onClick={() => setTab(it.id)} style={{ flex: 1, padding: "10px 0 12px", border: "none", background: "transparent", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 4, color: active ? C.green : C.muted, transition: "color 0.2s" }}>
+                <ItemIcon size={22} strokeWidth={active ? 2.4 : 2} />
+                <span style={{ fontSize: 11, fontWeight: active ? 700 : 500 }}>{it.label}</span>
+              </button>
+            );
+          })}
+        </div>
+      );
+    }
+
     function Dashboard({ data, computed, readOnly, updateSpendAlloc, onEditCategories, accounts = [] }) {
       const mainName = (accounts.find((a)=>a.id===PRIMARY_ID) || {}).name;
       const acctName = (id) => (accounts.find((a)=>a.id===id) || {}).name;
@@ -1391,13 +1732,27 @@
                 <div style={{ fontSize: 12, color: remainingSpending < 0 ? C.red : C.muted }}>{fmt(remainingSpending)} left</div>
               )}
             </div>
-            <div style={{ display: "flex", alignItems: "center", background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 11, padding: "0 14px", marginBottom: 10 }}>
-              <span style={{ color: C.muted, fontSize: 18 }}>{currSymbol}</span>
-              <input inputMode="decimal" autoFocus={autoFocus} value={amount} onChange={(e) => { const v = e.target.value; if (/^\d*\.?\d*$/.test(v)) setAmount(v); }} onKeyDown={(e) => { if (e.key === "Enter") handleAdd(); }} placeholder="0.00"
-                style={{ background: "transparent", border: "none", outline: "none", color: C.text, fontSize: 22, fontWeight: 700, width: "100%", padding: "14px 6px" }} />
-            </div>
-            <input value={merchant} onChange={(e) => setMerchant(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") handleAdd(); }} placeholder="Where? (optional)"
-              style={{ width: "100%", background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 11, outline: "none", color: C.text, fontSize: 15, padding: "13px 14px", marginBottom: 10 }} />
+            {IS_PHONE ? (
+              <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
+                <div style={{ display: "flex", alignItems: "center", background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 11, padding: "0 12px", flex: "0 0 48%", minWidth: 0 }}>
+                  <span style={{ color: C.muted, fontSize: 15, flexShrink: 0 }}>{currSymbol}</span>
+                  <input inputMode="decimal" autoFocus={autoFocus} value={amount} onChange={(e) => { const v = e.target.value; if (/^\d*\.?\d*$/.test(v)) setAmount(v); }} onKeyDown={(e) => { if (e.key === "Enter") handleAdd(); }} placeholder="0.00"
+                    style={{ background: "transparent", border: "none", outline: "none", color: C.text, fontSize: 17, fontWeight: 600, width: "100%", minWidth: 0, padding: "12px 4px" }} />
+                </div>
+                <input value={merchant} onChange={(e) => setMerchant(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") handleAdd(); }} placeholder="Where?"
+                  style={{ flex: 1, minWidth: 0, background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 11, outline: "none", color: C.text, fontSize: 15, padding: "12px 14px" }} />
+              </div>
+            ) : (
+              <React.Fragment>
+                <div style={{ display: "flex", alignItems: "center", background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 11, padding: "0 14px", marginBottom: 10 }}>
+                  <span style={{ color: C.muted, fontSize: 18 }}>{currSymbol}</span>
+                  <input inputMode="decimal" autoFocus={autoFocus} value={amount} onChange={(e) => { const v = e.target.value; if (/^\d*\.?\d*$/.test(v)) setAmount(v); }} onKeyDown={(e) => { if (e.key === "Enter") handleAdd(); }} placeholder="0.00"
+                    style={{ background: "transparent", border: "none", outline: "none", color: C.text, fontSize: 22, fontWeight: 700, width: "100%", padding: "14px 6px" }} />
+                </div>
+                <input value={merchant} onChange={(e) => setMerchant(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") handleAdd(); }} placeholder="Where? (optional)"
+                  style={{ width: "100%", background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 11, outline: "none", color: C.text, fontSize: 15, padding: "13px 14px", marginBottom: 10 }} />
+              </React.Fragment>
+            )}
             {merchantChips.length > 0 && (
               <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 12 }}>
                 {merchantChips.map((x) => <button key={x.name} onClick={() => pickMerchant(x)} style={{ padding: "5px 11px", borderRadius: 999, border: `1px solid ${C.border}`, background: C.bg2, color: C.sub, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>{x.name}</button>)}
@@ -1438,8 +1793,11 @@
         return () => window.removeEventListener("keydown", onKey);
       }, []);
       return (
-        <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", zIndex: 58, display: "flex", alignItems: "center", justifyContent: "center", padding: 20, animation: "fadeIn 0.2s ease" }}>
-          <div onClick={(e) => e.stopPropagation()} style={{ width: "100%", maxWidth: 460, background: C.bg, border: `1px solid ${C.border}`, borderRadius: 18, padding: 20, maxHeight: "90vh", overflowY: "auto", display: "flex", flexDirection: "column", gap: 14, animation: "popIn 0.2s ease" }}>
+        <div onClick={onClose} style={overlayStyle(58)}>
+          <div onClick={(e) => e.stopPropagation()} style={IS_PHONE
+            ? { ...panelStyle(460), background: C.bg, padding: "10px 16px 18px", paddingBottom: "calc(18px + env(safe-area-inset-bottom))", maxHeight: "90vh", display: "flex", flexDirection: "column", gap: 12 }
+            : { width: "100%", maxWidth: 460, background: C.bg, border: `1px solid ${C.border}`, borderRadius: 18, padding: 20, maxHeight: "90vh", overflowY: "auto", display: "flex", flexDirection: "column", gap: 14, animation: "popIn 0.2s ease" }}>
+            <SheetHandle mb={2} />
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ fontSize: 17, fontWeight: 700, color: C.text }}>Add purchase</div>
@@ -1991,8 +2349,9 @@
       const archiveTarget = archiveId ? store.periods.find((p)=>p.id===archiveId) : null;
       return (
         <React.Fragment>
-        <div onClick={onClose} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.55)", zIndex:50, display:"flex", alignItems:"center", justifyContent:"center", padding:20, animation:"fadeIn 0.2s ease" }}>
-          <div onClick={(e)=>e.stopPropagation()} style={{ width:"100%", maxWidth:520, background:C.bg2, border:`1px solid ${C.border}`, borderRadius:18, padding:22, maxHeight:"86vh", display:"flex", flexDirection:"column", animation:"popIn 0.2s ease" }}>
+        <div onClick={onClose} style={overlayStyle(50)}>
+          <div onClick={(e)=>e.stopPropagation()} style={panelStyle(520, { maxHeight:"86vh", display:"flex", flexDirection:"column", overflowY:undefined })}>
+            <SheetHandle mb={14} />
             <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:14 }}>
               <div style={{ display:"flex", alignItems:"center", gap:9, fontSize:18, fontWeight:700, color:C.text }}><CalendarDays size={19} color={C.green} /> {combining?"Pick 2–4 periods":"Pay Periods"} <span style={{ fontSize:13, color:C.muted, fontWeight:500 }}>({visiblePeriods.length})</span></div>
               <button onClick={onClose} style={{ width:32, height:32, borderRadius:9, border:"none", background:C.card, color:C.sub, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" }}><X size={18} /></button>
@@ -2150,7 +2509,7 @@
     }
 
     /* ================= Settings modal ================= */
-    function SettingsModal({ themeMode, setThemeMode, accent, setAccent, store, onReset, onRestore, onClose, travel, setTravel, user, showToast }) {
+    function SettingsModal({ themeMode, setThemeMode, accent, setAccent, store, onReset, onRestore, onClose, travel, setTravel, user, syncState, onSignIn, onSignOut, showToast }) {
       const [confirmReset, setConfirmReset] = useState(false);
       const [backupOpen, setBackupOpen] = useState(false);
       const [rateText, setRateText] = useState(String(travel.rate||150));
@@ -2159,12 +2518,35 @@
       const sectionLabel = { fontSize:12, fontWeight:700, color:C.muted, letterSpacing:0.5, marginBottom:10, marginTop:4 };
       const rowBtn = { width:"100%", display:"flex", alignItems:"center", gap:12, padding:"14px 16px", borderRadius:12, border:`1px solid ${C.border}`, background:C.card, fontSize:14.5, fontWeight:600, cursor:"pointer" };
       return (
-        <div onClick={onClose} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.55)", zIndex:55, display:"flex", alignItems:"center", justifyContent:"center", padding:20, animation:"fadeIn 0.2s ease" }}>
-          <div onClick={(e)=>e.stopPropagation()} style={{ width:"100%", maxWidth:520, background:C.bg2, border:`1px solid ${C.border}`, borderRadius:18, padding:24, maxHeight:"88vh", overflowY:"auto", animation:"popIn 0.2s ease" }}>
+        <div onClick={onClose} style={overlayStyle(55)}>
+          <div onClick={(e)=>e.stopPropagation()} style={panelStyle(520, IS_PHONE ? {} : { padding:24 })}>
+            <SheetHandle />
             <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:18 }}>
               <div style={{ display:"flex", alignItems:"center", gap:9, fontSize:18, fontWeight:700, color:C.text }}><Cog size={19} color={C.green} /> Settings</div>
               <button onClick={onClose} style={{ width:32, height:32, borderRadius:9, border:"none", background:C.card, color:C.sub, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" }}><X size={18} /></button>
             </div>
+            {IS_PHONE && onSignIn && (
+              // Phones have no sidebar, so sign-in lives here (as in the Android app).
+              <React.Fragment>
+                <div style={sectionLabel}>ACCOUNT &amp; SYNC</div>
+                {user ? (
+                  <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:13, padding:14, display:"flex", alignItems:"center", gap:12, marginBottom:22 }}>
+                    <div style={{ width:40, height:40, borderRadius:99, background:`linear-gradient(135deg, ${C.accent}, ${C.accent2})`, display:"flex", alignItems:"center", justifyContent:"center", color:"#fff", fontWeight:700, fontSize:17, flexShrink:0 }}>{(user.name||"U").slice(0,1).toUpperCase()}</div>
+                    <div style={{ flex:1, minWidth:0 }}>
+                      <div style={{ fontSize:14.5, fontWeight:600, color:C.text, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{user.name}</div>
+                      <div style={{ fontSize:12, color:C.green, display:"flex", alignItems:"center", gap:5, marginTop:1 }}><Cloud size={13} /> {syncState||"Synced"}</div>
+                    </div>
+                    <button onClick={onSignOut} style={{ display:"flex", alignItems:"center", gap:6, padding:"9px 12px", borderRadius:10, border:`1px solid ${C.border}`, background:"transparent", color:C.sub, fontSize:13, fontWeight:600, cursor:"pointer", flexShrink:0 }}><LogOut size={15} /> Sign out</button>
+                  </div>
+                ) : (
+                  <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:13, padding:16, marginBottom:22 }}>
+                    <div style={{ fontSize:12.5, color:C.muted, display:"flex", alignItems:"center", gap:6, marginBottom:12 }}><CloudOff size={14} /> {syncState==="Offline" ? "Offline — sync needs internet" : "Not signed in · this device only"}</div>
+                    <button onClick={onSignIn} style={{ width:"100%", display:"flex", alignItems:"center", justifyContent:"center", gap:10, padding:"12px 0", borderRadius:11, border:`1px solid ${C.border}`, background:C.bg2, color:C.text, fontSize:14.5, fontWeight:600, cursor:"pointer" }}><GoogleG size={18} /> Sign in with Google</button>
+                    <div style={{ fontSize:11.5, color:C.muted, marginTop:10, textAlign:"center", lineHeight:1.4 }}>Sign in to sync this budget with the Android app and your other devices.</div>
+                  </div>
+                )}
+              </React.Fragment>
+            )}
             <div style={sectionLabel}>APPEARANCE</div>
             <div style={{ display:"flex", gap:10, marginBottom:22 }}>
               {themeOpts.map(({ id, label, Ico })=>{ const th=THEMES[id], active=themeMode===id; return (
@@ -2893,6 +3275,8 @@
       const [travel, setTravel] = useState(()=>{ try { return JSON.parse(localStorage.getItem(TRAVEL_KEY))||{ enabled:false, code:"JPY", symbol:"¥", rate:150 }; } catch(e){ return { enabled:false, code:"JPY", symbol:"¥", rate:150 }; } });
       const [toast, setToast] = useState(null);
       const toastTimer = useRef(null);
+      const isPhone = useIsPhone();
+      IS_PHONE = isPhone; // before applyTheme, which rebuilds cardStyle for this layout
       applyTheme(themeMode, resolveAccent(accent.key, accent.custom));
 
       const showToast = (message, undo, note) => { setToast({ message, undo, note }); if (toastTimer.current) clearTimeout(toastTimer.current); toastTimer.current = setTimeout(()=>setToast(null), 4500); };
@@ -3171,6 +3555,53 @@
 
       const titleMap = { dashboard:"Dashboard", spending:"Spending", convert:"Converter", calendar:"Calendar", accounts:"Accounts", budget:"Budget" };
       const travelOn = travel.enabled && travel.rate>0;
+
+      if (isPhone) {
+        // Same screens as the Android app: header + period picker, Summary, bottom tabs, + button.
+        const showFab = (tab==="dashboard" || tab==="calendar") && singles.length>0 && !quickAdd;
+        return (
+          <div style={{ minHeight:"100vh", background:C.appBg, display:"flex", justifyContent:"center", color:C.text }}>
+            <div style={{ width:"100%", maxWidth:440, minHeight:"100vh", background:C.bg, display:"flex", flexDirection:"column", position:"relative", boxShadow:"0 0 60px rgba(0,0,0,0.4)" }}>
+              <div style={{ display:"flex", alignItems:"center", gap:10, padding:"18px 16px 14px", paddingTop:"calc(18px + env(safe-area-inset-top))", borderBottom:`1px solid ${C.border}`, background:C.chrome, backdropFilter:"blur(12px)", WebkitBackdropFilter:"blur(12px)", position:"sticky", top:0, zIndex:5 }}>
+                <div style={{ width:38, height:38, borderRadius:11, background:`linear-gradient(135deg, ${C.greenDim}, ${C.green})`, display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}><Wallet size={20} color="#06281d" /></div>
+                <button onClick={()=>setPeriodsOpen(true)} style={{ flex:1, minWidth:0, display:"flex", alignItems:"center", gap:8, background:"transparent", border:"none", cursor:"pointer", textAlign:"left", padding:0 }}>
+                  <div style={{ flex:1, minWidth:0 }}>
+                    <div style={{ fontSize:16, fontWeight:700, lineHeight:1.2, color:C.text }}>Weekly Budget</div>
+                    <div style={{ fontSize:12, color:C.sub, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{activePeriod.period}</div>
+                  </div>
+                  <div style={{ display:"flex", alignItems:"center", gap:4, color:C.sub, background:C.card, border:`1px solid ${C.border}`, borderRadius:9, padding:"6px 8px", flexShrink:0 }}><CalendarDays size={15} /><ChevronDown size={15} /></div>
+                </button>
+                <button onClick={()=>setSettingsOpen(true)} aria-label="Settings" style={{ width:38, height:38, borderRadius:10, border:`1px solid ${C.border}`, background:C.card, color:C.sub, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}><Cog size={18} /></button>
+              </div>
+
+              <div style={{ flex:1, padding:16, paddingBottom: showFab ? 88 : 16 }}>
+                <div key={tab+activePeriod.id} style={{ animation:"fadeSlide 0.28s ease" }}>
+                  {tab==="dashboard" && periodEnded && <PeriodEndedCard period={activePeriod} carry={carryOver} setCarry={setCarryOver} carryAmount={carryAmount} onStart={()=>createPeriod()} />}
+                  {tab==="dashboard" && <PhoneSummary data={view} computed={computed} readOnly={readOnly} addSpendAlloc={addSpendAlloc} updateSpendAlloc={updateSpendAlloc} removeSpendAlloc={removeSpendAlloc} accounts={store.accounts} />}
+                  {tab==="spending" && <SpendingView data={view} computed={computed} addTransaction={addTransaction} removeTransaction={removeTransaction} updateTransaction={updateTransaction} readOnly={readOnly} travel={travel} store={store} />}
+                  {tab==="convert" && <ConvertView computed={computed} travel={travel} setTravel={setTravel} onRefreshRate={()=>refreshRate(true)} />}
+                  {tab==="accounts" && <AccountsView store={store} onSaveAccount={saveAccount} onDeleteAccount={deleteAccount} onAddBalance={addBalance} onRemoveLog={removeBalanceLog} onMarkPaid={markPaid} />}
+                  {tab==="calendar" && <CalendarView data={view} store={store} onUpdateTx={updateTransaction} onRemoveTx={removeTransaction} onAddOnDay={singles.length ? openQuickAdd : null} />}
+                  {tab==="budget" && <BudgetView data={view} update={update} clearTransactions={clearTransactions} computed={computed} addAllocation={addAllocation} updateAllocation={updateAllocation} removeAllocation={removeAllocation} readOnly={readOnly} travel={travel} recurring={store.recurring} addRecurring={addRecurring} updateRecurring={updateRecurring} removeRecurring={removeRecurring} applyRecurring={applyRecurring} addSpendAlloc={addSpendAlloc} updateSpendAlloc={updateSpendAlloc} removeSpendAlloc={removeSpendAlloc} accounts={store.accounts} onAllocPaid={(aid, at)=>markPaid(activePeriod.id, aid, at, ((activePeriod.allocations||[]).find((a)=>a.id===aid)||{}).name)} />}
+                </div>
+              </div>
+
+              {showFab && (
+                <button onClick={()=>openQuickAdd()} aria-label="Add purchase" style={{ position:"fixed", right:"max(16px, calc((100vw - 440px) / 2 + 16px))", bottom:"calc(78px + env(safe-area-inset-bottom))", zIndex:20, width:56, height:56, borderRadius:18, border:"none", background:`linear-gradient(135deg, ${C.greenDim}, ${C.green})`, color:"#06281d", boxShadow:"0 8px 24px rgba(0,0,0,0.35)", cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" }}>
+                  <Plus size={26} strokeWidth={2.6} />
+                </button>
+              )}
+              <PhoneNav tab={tab} setTab={setTab} travelOn={travel && travel.enabled} />
+            </div>
+
+            {periodsOpen && <PeriodModal store={store} onClose={()=>setPeriodsOpen(false)} onSwitch={switchPeriod} onCreate={()=>createPeriod()} onDelete={deletePeriod} onCombine={combinePeriods} onArchive={archivePeriod} carry={carryOver} setCarry={setCarryOver} carryAmount={carryAmount} />}
+            {quickPeriod && <QuickAddModal key={quickAdd.pid + (quickAdd.day || "")} period={quickPeriod} store={store} travel={travel} addTransaction={(t)=>addTransaction(t, quickAdd.pid)} presetDay={quickAdd.day} isActive={quickAdd.pid===activePeriod.id} onClose={()=>setQuickAdd(null)} />}
+            {settingsOpen && <SettingsModal themeMode={themeMode} setThemeMode={setThemeMode} accent={accent} setAccent={setAccent} store={store} onReset={resetAllData} onRestore={restoreData} onClose={()=>setSettingsOpen(false)} travel={travel} setTravel={setTravel} user={user} syncState={syncState} onSignIn={signIn} onSignOut={signOut} showToast={showToast} />}
+            {toast && <Toast message={toast.message} note={toast.note} undo={toast.undo} raised={showFab} onClose={()=>setToast(null)} />}
+            {showOnboarding && <Onboarding onDone={finishOnboarding} />}
+          </div>
+        );
+      }
 
       return (
         <div className="shell">
